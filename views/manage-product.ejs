@@ -1,0 +1,146 @@
+<div class="flex justify-between items-center mb-6">
+    <h1 class="text-2xl font-bold text-gray-800"><%= product.name.toUpperCase() %></h1>
+    <div>
+        <button onclick="openModal('editProductModal')" class="bg-white hover:bg-gray-100 text-gray-800 font-semibold py-2 px-4 border border-gray-300 rounded-lg shadow-sm mr-2">Edit Product</button>
+        <a href="/products" class="bg-gray-800 hover:bg-gray-900 text-white font-bold py-2 px-4 rounded-lg">&larr; Back to List</a>
+    </div>
+</div>
+
+<div class="bg-white p-4 rounded-lg shadow-sm mb-6">
+    <p><span class="font-semibold">Description:</span> <%= product.description %></p>
+</div>
+
+<div class="space-y-4">
+    <% product.variants.forEach(variant => { %>
+        <% 
+            let stock = Array.isArray(variant.stock) ? variant.stock.length : 0;
+            let stockClass = 'bg-green-100 text-green-800';
+            let stockText = 'In Stock';
+            if (stock === 0) {
+                stockClass = 'bg-red-100 text-red-800';
+                stockText = 'Out of Stock';
+            } else if (stock <= 5) {
+                stockClass = 'bg-yellow-100 text-yellow-800';
+                stockText = 'Low Stock';
+            }
+        %>
+        <div class="bg-white border rounded-lg shadow-sm p-4 flex flex-col md:flex-row justify-between items-start md:items-center">
+            <div class="flex-1 mb-4 md:mb-0">
+                <p class="font-bold text-lg text-gray-900"><%= variant.name %></p>
+                <p class="text-sm text-gray-500 font-mono">ID: <%= variant.slug %></p>
+                <p class="text-sm text-gray-600">Price: <span class="font-semibold">Rp <%= variant.price.toLocaleString('id-ID') %></span></p>
+                <% if(variant.bulk_pricing && variant.bulk_pricing.min_quantity) { %>
+                    <p class="text-sm text-gray-600">Bulk: <span class="font-semibold text-green-600">Min <%= variant.bulk_pricing.min_quantity %> @ Rp <%= variant.bulk_pricing.price_per_item.toLocaleString('id-ID') %></span></p>
+                <% } %>
+                <p class="text-sm text-gray-600">Stock: <span class="text-xs font-medium px-2.5 py-1 rounded-full <%= stockClass %>"><%= stockText %> (<%= stock %>)</span></p>
+            </div>
+                <div class="flex items-center space-x-2 flex-shrink-0">
+                    <button onclick="openBulkPriceModal('<%= JSON.stringify(variant) %>')" class="bg-orange-400 hover:bg-orange-500 text-white text-xs font-semibold py-1 px-3 rounded-full">Bulk Price</button>
+                    <button onclick="openManageStockModal('<%= JSON.stringify(variant) %>')" class="bg-cyan-500 hover:bg-cyan-600 text-white text-xs font-semibold py-1 px-3 rounded-full">Manage Stock</button>
+                    <button onclick="openEditVariantModal('<%= JSON.stringify(variant) %>')" class="bg-gray-200 hover:bg-gray-300 text-gray-800 text-xs font-semibold py-1 px-3 rounded-full">Edit</button>
+
+                    <a href="/products/variants/delete/<%= product.id %>/<%= variant.slug %>" onclick="return confirm('Anda yakin ingin menghapus varian ini?')" class="bg-red-500 hover:bg-red-600 text-white text-xs font-semibold py-1 px-3 rounded-full">Hapus</a>
+                </div>
+        </div>
+    <% }) %>
+</div>
+
+<button onclick="openModal('addVariantModal')" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-lg mt-6">+ Add New Variant</button>
+
+<div id="editProductModal" class="fixed z-50 inset-0 overflow-y-auto hidden">
+    <div class="flex items-center justify-center min-h-screen">
+        <div class="fixed inset-0 bg-black opacity-50" onclick="closeModal('editProductModal')"></div>
+        <div class="bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:max-w-lg sm:w-full">
+            <form action="/products/edit/<%= product.id %>" method="POST">
+                <div class="bg-white px-6 py-4"><h3 class="text-lg font-medium text-gray-900 mb-4">Edit Product Details</h3><div class="mb-4"><label class="block text-sm">Name</label><input type="text" name="name" value="<%= product.name %>" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required></div><div class="mb-4"><label class="block text-sm">Description</label><textarea name="description" rows="4" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required><%= product.description %></textarea></div></div>
+                <div class="bg-gray-50 px-6 py-3 flex flex-row-reverse"><button type="submit" class="rounded-md px-4 py-2 bg-blue-600 text-white hover:bg-blue-700">Update</button><button type="button" onclick="closeModal('editProductModal')" class="rounded-md px-4 py-2 bg-white text-gray-700 hover:bg-gray-50 mr-3">Cancel</button></div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div id="manageStockModal" class="fixed z-50 inset-0 overflow-y-auto hidden">
+    <div class="flex items-center justify-center min-h-screen">
+        <div class="fixed inset-0 bg-black opacity-50" onclick="closeModal('manageStockModal')"></div>
+        <div class="bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:max-w-lg sm:w-full">
+            <form id="manageStockForm" method="POST">
+                <div class="bg-white px-6 py-4"><div class="flex justify-between items-center"><h3 class="text-lg font-medium text-gray-900">Stock - <span id="stockVariantName" class="font-bold"></span></h3><span id="stockTotal" class="text-sm font-semibold"></span></div><hr class="my-3"><div class="mb-4"><label class="block text-sm font-medium text-gray-700">Current Stock</label><textarea id="current_stock" name="current_stock" rows="8" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm font-mono text-sm"></textarea></div></div>
+                <div class="bg-gray-50 px-6 py-3 flex flex-row-reverse"><button type="submit" class="rounded-md px-4 py-2 bg-green-600 text-white hover:bg-green-700">Save Changes</button><button type="button" onclick="closeModal('manageStockModal')" class="rounded-md px-4 py-2 bg-white text-gray-700 hover:bg-gray-50 mr-3">Cancel</button></div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div id="addVariantModal" class="fixed z-50 inset-0 overflow-y-auto hidden">
+    <div class="flex items-center justify-center min-h-screen">
+        <div class="fixed inset-0 bg-black opacity-50" onclick="closeModal('addVariantModal')"></div>
+        <div class="bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:max-w-lg sm:w-full">
+            <form action="/products/variants/add/<%= product.id %>" method="POST">
+                <div class="bg-white px-6 py-4"><h3 class="text-lg font-medium text-gray-900 mb-4">Add New Variant</h3><div class="mb-4"><label class="block text-sm">Name</label><input type="text" name="name" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required></div><div class="mb-4"><label class="block text-sm">Slug</label><input type="text" name="slug" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required></div><div class="mb-4"><label class="block text-sm">Price</label><input type="number" name="price" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required></div></div>
+                <div class="bg-gray-50 px-6 py-3 flex flex-row-reverse"><button type="submit" class="rounded-md px-4 py-2 bg-blue-600 text-white hover:bg-blue-700">Save</button><button type="button" onclick="closeModal('addVariantModal')" class="rounded-md px-4 py-2 bg-white text-gray-700 hover:bg-gray-50 mr-3">Cancel</button></div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div id="editVariantModal" class="fixed z-50 inset-0 overflow-y-auto hidden">
+    <div class="flex items-center justify-center min-h-screen">
+        <div class="fixed inset-0 bg-black opacity-50" onclick="closeModal('editVariantModal')"></div>
+        <div class="bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:max-w-lg sm:w-full">
+            <form id="editVariantForm" method="POST">
+                <div class="bg-white px-6 py-4"><h3 class="text-lg font-medium text-gray-900 mb-4">Edit Variant</h3><div class="mb-4"><label class="block text-sm">Name</label><input type="text" id="edit_name" name="name" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required></div><div class="mb-4"><label class="block text-sm">Price</label><input type="number" id="edit_price" name="price" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" required></div><div class="mb-4"><label class="block text-sm">SNK</label><input type="text" id="edit_snk" name="snk" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" placeholder="-"></div></div>
+                <div class="bg-gray-50 px-6 py-3 flex flex-row-reverse"><button type="submit" class="rounded-md px-4 py-2 bg-blue-600 text-white hover:bg-blue-700">Update</button><button type="button" onclick="closeModal('editVariantModal')" class="rounded-md px-4 py-2 bg-white text-gray-700 hover:bg-gray-50 mr-3">Cancel</button></div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div id="bulkPriceModal" class="fixed z-50 inset-0 overflow-y-auto hidden">
+    <div class="flex items-center justify-center min-h-screen">
+        <div class="fixed inset-0 bg-black opacity-50" onclick="closeModal('bulkPriceModal')"></div>
+        <div class="bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:max-w-lg sm:w-full">
+            <form id="bulkPriceForm" method="POST">
+                <div class="bg-white px-6 py-4"><h3 class="text-lg font-medium text-gray-900 mb-4">Bulk Price Management</h3><div class="grid grid-cols-2 gap-4"><div class="mb-4"><label class="block text-sm">Min Pembelian</label><input type="number" id="bulk_min_quantity" name="min_quantity" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" placeholder="e.g. 3"></div><div class="mb-4"><label class="block text-sm">Harga per Item</label><input type="number" id="bulk_price_per_item" name="price_per_item" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" placeholder="e.g. 1000"></div></div><p class="text-xs text-gray-500">Kosongkan kedua kolom untuk menghapus aturan harga grosir.</p></div>
+                <div class="bg-gray-50 px-6 py-3 flex flex-row-reverse"><button type="submit" class="rounded-md px-4 py-2 bg-orange-500 text-white hover:bg-orange-600">Save Rule</button><button type="button" onclick="closeModal('bulkPriceModal')" class="rounded-md px-4 py-2 bg-white text-gray-700 hover:bg-gray-50 mr-3">Cancel</button></div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+    function openModal(id) {
+        document.getElementById(id).classList.remove('hidden');
+    }
+
+    function closeModal(id) {
+        document.getElementById(id).classList.add('hidden');
+    }
+
+    function openManageStockModal(variantJson) {
+        const variant = JSON.parse(variantJson);
+        document.getElementById('manageStockForm').action = '/products/stock/update/<%= product.id %>/' + variant.slug;
+        document.getElementById('stockVariantName').innerText = variant.name;
+        const stockList = Array.isArray(variant.stock) ? variant.stock.join('\n') : '';
+        document.getElementById('current_stock').value = stockList;
+        document.getElementById('stockTotal').innerText = 'Total Stock: ' + (Array.isArray(variant.stock) ? variant.stock.length : 0);
+        openModal('manageStockModal');
+    }
+
+    function openEditVariantModal(variantJson) {
+        const variant = JSON.parse(variantJson);
+        document.getElementById('editVariantForm').action = '/products/variants/edit/<%= product.id %>/' + variant.slug;
+        document.getElementById('edit_name').value = variant.name;
+        document.getElementById('edit_price').value = variant.price;
+        document.getElementById('edit_snk').value = variant.snk || '';
+        openModal('editVariantModal');
+    }
+
+    function openBulkPriceModal(variantJson) {
+        const variant = JSON.parse(variantJson);
+        document.getElementById('bulkPriceForm').action = '/products/variants/bulk/<%= product.id %>/' + variant.slug;
+        const bulk = variant.bulk_pricing;
+        document.getElementById('bulk_min_quantity').value = bulk ? bulk.min_quantity : '';
+        document.getElementById('bulk_price_per_item').value = bulk ? bulk.price_per_item : '';
+        openModal('bulkPriceModal');
+    }
+</script>

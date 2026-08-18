@@ -1,0 +1,53 @@
+<% if (locals.success) { %>
+<div class="bg-green-100 border-l-4 border-green-500 text-green-700 px-4 py-3 rounded mb-6" role="alert">
+    <p><%= success %></p>
+</div>
+<% } %>
+<% if (locals.error) { %>
+<div class="bg-red-100 border-l-4 border-red-500 text-red-700 px-4 py-3 rounded mb-6" role="alert">
+    <p><%= error %></p>
+</div>
+<% } %>
+
+<div class="bg-white rounded-lg shadow-md">
+    <div class="p-6 border-b flex items-center">
+        <svg class="w-6 h-6 mr-3 text-purple-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+        <h2 class="text-xl font-semibold text-gray-800">Asset Management</h2>
+    </div>
+    <form action="/assets/replace" method="POST" enctype="multipart/form-data" class="p-6">
+        <div class="space-y-6">
+            <p class="text-sm text-gray-600">Update the core visual assets of the bot. Like the welcome image.</p>
+            
+            <div>
+                <label for="asset_selector" class="block text-sm font-medium text-gray-700 mb-1">Select Asset to Replace</label>
+                <select id="asset_selector" name="asset_to_replace" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+                    <option value="welcome.png" data-preview-src="/welcome.png">Welcome Image (welcome.png)</option>
+                    </select>
+            </div>
+
+            <div id="image_preview_container">
+                <img id="image_preview" src="/welcome.png" alt="Asset preview" class="max-w-xs rounded-md border shadow-sm">
+            </div>
+
+            <div>
+                <label for="new_image_file" class="block text-sm font-medium text-gray-700">Upload New Image</label>
+                <input type="file" name="new_image_file" id="new_image_file" required class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
+            </div>
+        </div>
+
+        <div class="flex justify-end pt-6 border-t mt-6">
+            <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg shadow-md flex items-center">
+                 <svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h5M20 20v-5h-5M4 20h5v-5M20 4h-5v5" /></svg>
+                 Replace Asset
+            </button>
+        </div>
+    </form>
+</div>
+
+<script>
+    document.getElementById('asset_selector').addEventListener('change', function() {
+        const selectedOption = this.options[this.selectedIndex];
+        const previewSrc = selectedOption.getAttribute('data-preview-src');
+        document.getElementById('image_preview').src = previewSrc + '?t=' + new Date().getTime(); // Menambahkan timestamp untuk bypass cache
+    });
+</script>

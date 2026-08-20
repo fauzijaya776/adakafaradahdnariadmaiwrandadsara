@@ -4,8 +4,8 @@
   "description": "A Telegram bot for an app store.",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "web": "node app.js"
+    "start": "node all.js",
+    "web": "node all.js"
   },
   "dependencies": {
     "axios": "^1.11.0",

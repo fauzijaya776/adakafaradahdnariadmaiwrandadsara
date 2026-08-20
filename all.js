@@ -558,15 +558,14 @@ async function generateStartMessageAndKeyboard(ctx) {
     const totalSpentRp = (user.totalSpent || 0).toLocaleString('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 });
     const balanceRp = (user.balance || 0).toLocaleString('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 });
 
-    const message = `👋 — Hello ${ctx.from.first_name} Selamat Datang Di FZI STORE\n\n` +
+    const message = `👋 — Hello ${ctx.from.first_name} Selamat Datang Di ALIM STORE\n\n` +
                     `🗓️ ${new Date().toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}\n\n` +
                     `*User Details :*\n` +
                     `├ ID : \`${user.id}\`\n` +
                     `├ Username : @${user.username}\n` +
-                    `├ Balance : ${balanceRp}\n` +
                     `└ Total Spent : ${totalSpentRp}\n\n` +
                     `*BOT Statistics*\n\n` +
-                    `├ Products Sold : ${5127 + productsSoldCount} Accounts\n` +
+                    `├ Products Sold : ${9125 + productsSoldCount} Accounts\n` +
                     `└ Total Users : ${1026 + totalUsers} Users\n\n` +
                     `Silahkan tekan tombol '🛒 List Produk'\n` +
                     `Bot Ubah Vps Ke Rdp (installer rdp) @fzistorebot\n`;
@@ -1520,7 +1519,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
                     if (order.quantity < 10) {
                         const formattedItems = order.reservedItems.map((item, index) => `${index + 1}. ${item}`).join('\n');
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285173329868\n\n` +
+                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
                             `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
                             `– Metode: QRIS\n– ID Transaksi: \`${payment.displayOrderId}\`\n\n` +
                             "```\n" + `${order.productName.toUpperCase()}\n${formattedItems}` + "\n```";
@@ -1528,7 +1527,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                         await bot.telegram.sendMessage(order.customerInfo.telegramUserId, successMessage, { parse_mode: 'Markdown' });
 
                     } else {
-                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285173329868\n\n` +
+                        let successMessage = `🧾 *Pembelian Berhasil*\n\nTerima kasih!, Jika Ada Pertanyaan Silahkan Chat Admin Di wa.me/6285753323094\n\n` +
                             `*Informasi Pembelian:*\n– Total Dibayar: Rp ${order.amount.toLocaleString('id-ID')}\n` +
                             `– Metode: QRIS\n– ID Transaksi: \`${payment.displayOrderId}\`\n\n` +
                             `Anda membeli *${order.quantity}* item. Akun Anda dikirimkan dalam file terpisah.`;

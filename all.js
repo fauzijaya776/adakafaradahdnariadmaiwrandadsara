@@ -18,7 +18,7 @@ const mongoose = require('mongoose');
 const moment = require('moment-timezone');
 
 // Impor modul lokal
-const { connectDB, User, Product, Order, Settings } = require('./db');
+const { connectDB, User, Product, Order, Settings, slimPaymentDetails } = require('./db');
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const linkqu = require('./qris_linkqu');
@@ -36,6 +36,88 @@ const GROUP_NOTIF_ID = process.env.GROUP_NOTIF_ID;
 // Ambil userStates dari modul admin dan inisialisasi sesi pembayaran
 const { userStates } = adminModule;
 const paymentSessions = new Map();
+
+// =============================================================
+// KEBIJAKAN RETENSI DATA (MongoDB Atlas M0 hanya 512MB)
+// =============================================================
+// Order yang tidak jadi dibayar (PENDING/EXPIRED/CANCELLED/FAILED) dihapus
+// otomatis oleh TTL index MongoDB setelah sekian jam. Invoice hanya hidup
+// 3 menit, jadi 24 jam sudah sangat longgar.
+const JUNK_ORDER_TTL_HOURS = parseInt(process.env.JUNK_ORDER_TTL_HOURS || '24', 10);
+// Isi akun (reservedItems) pada order LUNAS dikosongkan setelah sekian hari.
+// Order-nya tetap ada, jadi statistik & Riwayat Transaksi tidak terpengaruh.
+const PAID_ITEMS_RETENTION_DAYS = parseInt(process.env.PAID_ITEMS_RETENTION_DAYS || '30', 10);
+// Seberapa sering job pembersihan berjalan di dalam bot.
+const MAINTENANCE_INTERVAL_HOURS = 6;
+
+function junkOrderExpiry() {
+    return new Date(Date.now() + JUNK_ORDER_TTL_HOURS * 60 * 60 * 1000);
+}
+
+// Pembersihan berkala: TTL index sudah menangani penghapusan order sampah,
+// job ini menangani hal yang tidak bisa dilakukan TTL (mengosongkan field)
+// plus jaring pengaman kalau TTL index belum sempat terbentuk.
+async function runStorageMaintenance() {
+    try {
+        // 0. PEMULIHAN STOK NYANGKUT.
+        // Kalau bot mati/restart di tengah pembayaran, order tetap PENDING dan
+        // stoknya tertinggal di reserved_stock selamanya (stok "hilang").
+        // Order yang masih PENDING > 1 jam pasti sudah gagal (invoice cuma 3
+        // menit), jadi stoknya aman dikembalikan.
+        const strandedCutoff = new Date(Date.now() - 60 * 60 * 1000);
+        const stranded = await Order.find({
+            status: 'PENDING',
+            createdAt: { $lt: strandedCutoff },
+            reservedItems: { $exists: true, $ne: [] }
+        }).lean();
+
+        for (const order of stranded) {
+            try {
+                await Product.updateOne(
+                    { id: order.productId, 'variants.slug': order.variantSlug },
+                    {
+                        $push: { 'variants.$.stock': { $each: order.reservedItems } },
+                        $pull: { 'variants.$.reserved_stock': { $in: order.reservedItems } }
+                    }
+                );
+                await Order.updateOne(
+                    { _id: order._id, status: 'PENDING' },
+                    { $set: { status: 'EXPIRED' } }
+                );
+            } catch (itemError) {
+                console.error(`Gagal memulihkan stok order ${order.orderId}:`, itemError.message);
+            }
+        }
+        if (stranded.length > 0) {
+            console.log(`♻️  Maintenance: stok dari ${stranded.length} order nyangkut dikembalikan.`);
+        }
+
+        const junkCutoff = new Date(Date.now() - JUNK_ORDER_TTL_HOURS * 60 * 60 * 1000);
+        const deleted = await Order.deleteMany({
+            status: { $ne: 'PAID' },
+            createdAt: { $lt: junkCutoff }
+        });
+
+        const stripCutoff = new Date(Date.now() - PAID_ITEMS_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+        const stripped = await Order.updateMany(
+            {
+                status: 'PAID',
+                createdAt: { $lt: stripCutoff },
+                $or: [
+                    { reservedItems: { $exists: true, $ne: [] } },
+                    { paymentDetails: { $exists: true, $ne: null } }
+                ]
+            },
+            { $set: { reservedItems: [] }, $unset: { paymentDetails: '' } }
+        );
+
+        if (deleted.deletedCount > 0 || stripped.modifiedCount > 0) {
+            console.log(`🧹 Maintenance: ${deleted.deletedCount} order sampah dihapus, ${stripped.modifiedCount} order lunas lama diringkas.`);
+        }
+    } catch (error) {
+        console.error('Storage maintenance error:', error.message);
+    }
+}
 
 async function sendAdminNotification(bot, order) {
     if (!GROUP_NOTIF_ID) {
@@ -277,7 +359,14 @@ app.get('/products/variants/delete/:id/:slug', authMiddleware, async (req, res) 
 app.get('/', authMiddleware, async (req, res) => {
     try {
         const totalUsers = await User.countDocuments();
-        const paidOrders = await Order.find({ status: 'PAID' }).sort({ createdAt: -1 });
+        // Sebelumnya menarik SEMUA order lunas (termasuk data akun) ke memori
+        // hanya untuk dihitung & diambil 5 teratas. Sekarang dipisah.
+        const paidOrdersCountValue = await Order.countDocuments({ status: 'PAID' });
+        const paidOrders = await Order.find({ status: 'PAID' })
+            .sort({ createdAt: -1 })
+            .limit(5)
+            .select('amount paidAt productName variantName customerInfo')
+            .lean();
         const products = await Product.find({});
         
         // HAPUS ATAU BERI KOMENTAR BARIS INI
@@ -287,7 +376,7 @@ app.get('/', authMiddleware, async (req, res) => {
         const linkquBalance = await linkqu.checkBalance();
 
         const totalStock = products.flatMap(p => p.variants).reduce((sum, v) => sum + (v.stock?.length || 0), 0);
-        const recentTransactions = paidOrders.slice(0, 5);
+        const recentTransactions = paidOrders;
         
         // UBAH CARA ANDA MENGIRIM DATA KE VIEW
         res.render('layout', {
@@ -297,7 +386,7 @@ app.get('/', authMiddleware, async (req, res) => {
                 revenueSource: 'Linkqu Balance', // <-- Tambahkan sumber pendapatan
                 totalUsers, 
                 totalStock,
-                paidOrdersCount: paidOrders.length,
+                paidOrdersCount: paidOrdersCountValue,
                 recentTransactions
             })
         });
@@ -519,16 +608,59 @@ app.get('/api-docs', authMiddleware, async (req, res) => {
 
 adminModule(bot);
 
+// === HELPER: escape karakter spesial Markdown (legacy) ===
+// FIX BUG: nama/username Telegram yang mengandung _ * ` [ ] membuat Telegram
+// menolak seluruh pesan ("can't parse entities") sehingga /start gagal.
+function escapeMd(text) {
+    return String(text === null || text === undefined ? '' : text)
+        .replace(/([_*`\[\]])/g, '\\$1');
+}
+
+// === HELPER: pastikan dokumen user SELALU ada ===
+// FIX BUG UTAMA: customer baru bisa belum punya dokumen di DB (upsert gagal,
+// race saat /start ditekan cepat 2x, atau error transient). Fungsi ini
+// idempotent dan aman terhadap duplicate key (E11000).
+async function ensureUser(from) {
+    const userId = from.id.toString();
+    const username = from.username || 'N/A';
+    try {
+        const user = await User.findOneAndUpdate(
+            { id: userId },
+            {
+                $set: { username },
+                $setOnInsert: { balance: 0, totalSpent: 0 }
+            },
+            // setDefaultsOnInsert sengaja DIMATIKAN: nilai awal sudah ditulis
+            // eksplisit di $setOnInsert, jadi tidak ada dua sumber yang bisa
+            // bentrok di path yang sama.
+            { upsert: true, new: true, setDefaultsOnInsert: false }
+        ).lean();
+        if (user) {
+            // Jaring pengaman: pastikan field `id` benar-benar tersimpan.
+            if (!user.id) {
+                await User.updateOne({ _id: user._id }, { $set: { id: userId } });
+                user.id = userId;
+            }
+            return user;
+        }
+    } catch (error) {
+        // Race condition: dua update masuk bersamaan -> salah satu duplicate key.
+        if (error && (error.code === 11000 || error.code === 11001)) {
+            const existing = await User.findOne({ id: userId }).lean();
+            if (existing) return existing;
+        } else {
+            console.error('ensureUser error:', error.message);
+        }
+    }
+    // Fallback in-memory supaya /start TIDAK PERNAH crash walau DB bermasalah.
+    return { id: userId, username, balance: 0, totalSpent: 0 };
+}
+
 bot.use(async (ctx, next) => {
     //console.log(JSON.stringify(ctx.update, null, 2));
-    if (ctx.from) {
-        const userId = ctx.from.id.toString();
+    if (ctx.from && !ctx.from.is_bot) {
         try {
-            await User.findOneAndUpdate(
-                { id: userId },
-                { $setOnInsert: { username: ctx.from.username || 'N/A' } },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
-            );
+            ctx.state.user = await ensureUser(ctx.from);
         } catch (error) {
             console.error("Error in user middleware:", error);
         }
@@ -547,7 +679,10 @@ async function findProductAndVariant(productId, variantSlug) {
 
 async function generateStartMessageAndKeyboard(ctx) {
     const userId = ctx.from.id.toString();
-    const user = await User.findOne({ id: userId }).lean();
+    // FIX BUG: sebelumnya `User.findOne(...)` mengembalikan null untuk customer
+    // baru, lalu `user.totalSpent` melempar TypeError -> muncul pesan
+    // "Terjadi kesalahan saat memulai bot". Sekarang user dijamin ada.
+    const user = ctx.state.user || await ensureUser(ctx.from);
     const totalUsers = await User.countDocuments();
     const productsSoldCountResult = await Order.aggregate([
         { $match: { status: 'PAID' } },
@@ -558,11 +693,15 @@ async function generateStartMessageAndKeyboard(ctx) {
     const totalSpentRp = (user.totalSpent || 0).toLocaleString('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 });
     const balanceRp = (user.balance || 0).toLocaleString('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 });
 
-    const message = `👋 — Hello ${ctx.from.first_name} Selamat Datang Di FZI STORE\n\n` +
+    // FIX BUG: nama & username di-escape agar tidak merusak parsing Markdown.
+    const displayName = escapeMd(ctx.from.first_name || 'User');
+    const displayUsername = escapeMd(user.username || ctx.from.username || 'N/A');
+
+    const message = `👋 — Hello ${displayName} Selamat Datang Di FZI STORE\n\n` +
                     `🗓️ ${new Date().toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}\n\n` +
                     `*User Details :*\n` +
-                    `├ ID : \`${user.id}\`\n` +
-                    `├ Username : @${user.username}\n` +
+                    `├ ID : \`${userId}\`\n` +
+                    `├ Username : @${displayUsername}\n` +
                     `└ Total Spent : ${totalSpentRp}\n\n` +
                     `*BOT Statistics*\n\n` +
                     `├ Products Sold : ${7125 + productsSoldCount} Accounts\n` +
@@ -570,7 +709,8 @@ async function generateStartMessageAndKeyboard(ctx) {
                     `Silahkan tekan tombol '🛒 List Produk'\n` +
                     `Bot Ubah Vps Ke Rdp (installer rdp) @fzistorebot\n`;
 
-    const ADMIN_IDS = process.env.OWNER_ID.split(',').map(id => id.trim());
+    // FIX BUG: OWNER_ID yang belum diset membuat .split() melempar TypeError.
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     const isAdmin = ADMIN_IDS.includes(userId);
     const keyboardLayout = [['🛒 List Produk', '🧾 Riwayat Transaksi'], ['📦 Cek Stok']];
     if (isAdmin) keyboardLayout.push(['⚙️ Admin Panel']);
@@ -592,7 +732,7 @@ async function generateProductListMessageAndKeyboard(page = 1) {
     } else {
         products.forEach((p, index) => {
             const productNumber = (page - 1) * productsPerPage + index + 1;
-            message += `*[${productNumber}]* ${p.name.toUpperCase()}\n`;
+            message += `*[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())}\n`;
             keyboardButtons.push(Markup.button.callback(`${productNumber}`, `show_product_${p.id}_page_${page}`));
         });
     }
@@ -618,18 +758,53 @@ async function generateProductListMessageAndKeyboard(page = 1) {
     return { message, keyboard };
 }
 
-async function generateStockTextMessage() {
+// BARU: /stock kini mengembalikan pesan + INLINE KEYBOARD daftar produk,
+// sehingga customer bisa langsung menekan nomor produk untuk melihat detail
+// dan membeli tanpa harus membuka menu 'List Produk' lagi.
+async function generateStockMessageAndKeyboard() {
     const products = await Product.find({}).sort({ name: 1 }).lean();
-    let message = `🛒 *Informasi Stok*\n- Tanggal: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}\n\n`;
+    let message = `🛒 *Informasi Stok*\n- Tanggal: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}\n────────────✧\n`;
+    const productButtons = [];
+
     if (!products || products.length === 0) {
         message += 'Saat ini belum ada produk yang tersedia.';
     } else {
         products.forEach((p, index) => {
-            const totalStock = p.variants.reduce((sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
-            message += `*→* *${index + 1}. ${p.name.toUpperCase()}* → x${totalStock}\n`;
+            const variants = Array.isArray(p.variants) ? p.variants : [];
+            const totalStock = variants.reduce((sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
+            const stockEmoji = totalStock > 0 ? '✅' : '❌';
+            const productNumber = index + 1;
+            // FIX BUG: nama produk di-escape agar karakter _ * ` [ ] tidak
+            // merusak parsing Markdown (pesan gagal terkirim).
+            message += `${stockEmoji} *[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())} → x${totalStock}\n`;
+            // Batas aman inline keyboard Telegram (maks 100 tombol / pesan).
+            if (productButtons.length < 50) {
+                productButtons.push(Markup.button.callback(`${productNumber}`, `show_product_${p.id}_page_1`));
+            }
         });
+        message += `────────────✧\n`;
+        message += `_Tekan tombol angka di bawah untuk melihat detail varian & membeli._`;
     }
-    message += `\nUntuk membeli, silakan tekan tombol '🛒 List Produk' di bawah.`;
+
+    const chunkedButtons = [];
+    for (let i = 0; i < productButtons.length; i += 5) {
+        chunkedButtons.push(productButtons.slice(i, i + 5));
+    }
+
+    const keyboard = Markup.inlineKeyboard([
+        ...chunkedButtons,
+        [
+            Markup.button.callback('🔄 Refresh Stok', 'refresh_stock'),
+            Markup.button.callback('🛒 List Produk', 'list_products_1')
+        ]
+    ]);
+
+    return { message, keyboard };
+}
+
+// Dipertahankan untuk kompatibilitas (kalau ada pemanggil lain).
+async function generateStockTextMessage() {
+    const { message } = await generateStockMessageAndKeyboard();
     return message;
 }
 
@@ -648,7 +823,7 @@ async function generateProductDetailsMessageAndKeyboard(productId, page) {
             ? product.description 
             : '_Tidak ada deskripsi untuk produk ini._';
 
-        let message = `📦 *Detail Produk: ${product.name.toUpperCase()}*\n` +
+        let message = `📦 *Detail Produk: ${escapeMd(String(product.name || '-').toUpperCase())}*\n` +
                       `*Deskripsi:*\n${descriptionText}\n` +
                       `────────────✧\n` +
                       `*Pilih Varian Tersedia:*\n`;
@@ -659,7 +834,7 @@ async function generateProductDetailsMessageAndKeyboard(productId, page) {
             const stockEmoji = stockCount > 0 ? '✅' : '❌';
             const stockStatus = stockCount > 0 ? `Stok: ${stockCount}` : 'Stok: Habis';
             
-            message += `\n${stockEmoji} *${v.name}*\n`;
+            message += `\n${stockEmoji} *${escapeMd(v.name)}*\n`;
             message += `   ↳ Harga: Rp ${v.price.toLocaleString('id-ID')} - *${stockStatus}*\n`;
             
             if (v.bulk_pricing?.min_quantity > 0) {
@@ -812,24 +987,37 @@ bot.start(async (ctx) => {
     try {
         const { message, keyboard } = await generateStartMessageAndKeyboard(ctx);
         const imagePath = path.join(__dirname, 'assets', 'welcome.png');
+        // FIX BUG: kalau assets/welcome.png hilang, replyWithPhoto melempar
+        // error dan customer hanya melihat "Terjadi kesalahan saat memulai bot".
+        const fileExists = await fs.access(imagePath).then(() => true).catch(() => false);
 
-        // Modifikasi di sini:
-        // Keyboard menu utama sekarang dilampirkan langsung ke pesan foto
-        await ctx.replyWithPhoto(
-            { source: imagePath },
-            {
-                caption: message,
-                parse_mode: 'Markdown',
-                // Baris ini akan menampilkan menu utama di bawah layar
-                reply_markup: keyboard.reply_markup 
-            }
-        );
-
-        // Baris yang mengirim teks "Gunakan menu di bawah..." telah dihapus.
+        if (fileExists) {
+            // Keyboard menu utama dilampirkan langsung ke pesan foto
+            await ctx.replyWithPhoto(
+                { source: imagePath },
+                {
+                    caption: message,
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard.reply_markup
+                }
+            );
+        } else {
+            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        }
 
     } catch (error) {
         console.error('Error in /start:', error);
-        await ctx.reply('❌ Terjadi kesalahan saat memulai bot.');
+        // Fallback terakhir: kirim tanpa Markdown supaya user tetap dapat menu.
+        try {
+            const { message, keyboard } = await generateStartMessageAndKeyboard(ctx);
+            const plain = message
+                .replace(/\\([_*`\[\]])/g, '$1')  // buang backslash hasil escapeMd
+                .replace(/[*`]/g, '');
+            await ctx.reply(plain, { reply_markup: keyboard.reply_markup });
+        } catch (fallbackError) {
+            console.error('Error in /start fallback:', fallbackError);
+            await ctx.reply('❌ Terjadi kesalahan saat memulai bot.');
+        }
     }
 });
 
@@ -1060,6 +1248,7 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             orderId: internalOrderId,
             amount: finalAmount,
             status: "PENDING",
+            expiresAt: junkOrderExpiry(),
             productId, variantSlug, quantity, reservedItems,
             productName: product.name,
             variantName: variant.name,
@@ -1123,7 +1312,12 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                 
                 const order = await Order.findOneAndUpdate(
                     { orderId: internalOrderId, status: 'PENDING' },
-                    { $set: { status: 'PAID', paidAt: new Date(), paymentDetails: statusResult } },
+                    {
+                        // HEMAT STORAGE: ringkasan saja, bukan payload mentah gateway.
+                        $set: { status: 'PAID', paidAt: new Date(), paymentDetails: slimPaymentDetails(statusResult) },
+                        // Order lunas tidak boleh ikut terhapus TTL.
+                        $unset: { expiresAt: '' }
+                    },
                     { new: true }
                 );
 
@@ -1238,6 +1432,7 @@ bot.action(/^qris_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             internalRefId: internalOrderId,
             amount: payment.amount,
             status: "PENDING",
+            expiresAt: junkOrderExpiry(),
             ...orderDetails,
             customerInfo,
             paymentGateway: "linkqu",
@@ -1434,6 +1629,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             depositId: payment.realOrderId,
             amount: payment.amount,
             status: "PENDING",
+            expiresAt: junkOrderExpiry(),
             ...orderDetails,
             customerInfo,
             paymentGateway: "dompetx",
@@ -1505,6 +1701,8 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 
                     order.status = "PAID";
                     order.paidAt = new Date();
+                    // Order lunas tidak boleh ikut terhapus TTL.
+                    order.expiresAt = undefined;
                     await order.save();
 
                     await Product.updateOne(
@@ -1703,11 +1901,32 @@ bot.action(/^cancel_payment_(.*)$/, async (ctx) => {
 
 bot.command('stock', async (ctx) => {
     try {
-        const message = await generateStockTextMessage();
-        await ctx.reply(message, { parse_mode: 'Markdown' });
+        const { message, keyboard } = await generateStockMessageAndKeyboard();
+        await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
     } catch (error) {
         console.error("Error in /stock command:", error);
         await ctx.reply("❌ Gagal memuat informasi stok.");
+    }
+});
+
+// Tombol refresh pada pesan /stock
+bot.action('refresh_stock', async (ctx) => {
+    try {
+        const { message, keyboard } = await generateStockMessageAndKeyboard();
+        try {
+            await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            await ctx.answerCbQuery('✅ Stok diperbarui.');
+        } catch (editError) {
+            // Telegram menolak edit bila isi pesan sama persis.
+            if (String(editError.description || editError.message || '').includes('message is not modified')) {
+                await ctx.answerCbQuery('Stok masih sama.');
+            } else {
+                throw editError;
+            }
+        }
+    } catch (error) {
+        console.error('Error in refresh_stock:', error);
+        try { await ctx.answerCbQuery('❌ Gagal memuat stok.', { show_alert: true }); } catch (e) {}
     }
 });
 
@@ -1748,8 +1967,8 @@ bot.hears('🛒 List Produk', async (ctx) => {
 
 bot.hears('📦 Cek Stok', async (ctx) => {
     try {
-        const message = await generateStockTextMessage();
-        await ctx.reply(message, { parse_mode: 'Markdown' });
+        const { message, keyboard } = await generateStockMessageAndKeyboard();
+        await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
     } catch (error) {
         console.error("Error in hears Cek Stok:", error);
         await ctx.reply("❌ Gagal memuat informasi stok.");
@@ -1757,7 +1976,7 @@ bot.hears('📦 Cek Stok', async (ctx) => {
 });
 
 bot.hears('⚙️ Admin Panel', async (ctx) => {
-    const ADMIN_IDS = process.env.OWNER_ID.split(',').map(id => id.trim());
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     if (!ADMIN_IDS.includes(ctx.from.id.toString())) { return; }
     try {
         const { message, keyboard } = await adminModule.getAdminMenuMessageAndKeyboard();
@@ -2342,6 +2561,11 @@ bot.launch().then(() => {
 }).catch(err => {
     console.error('❌ Error saat menjalankan bot:', err);
 });
+
+// Pembersihan storage: sekali saat start (ditunda 30 detik agar koneksi DB
+// dan pembuatan index selesai dulu), lalu berkala.
+setTimeout(runStorageMaintenance, 30 * 1000);
+setInterval(runStorageMaintenance, MAINTENANCE_INTERVAL_HOURS * 60 * 60 * 1000);
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

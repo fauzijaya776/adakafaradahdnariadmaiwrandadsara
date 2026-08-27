@@ -4,7 +4,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const moment = require("moment-timezone");
 // REVISI: Impor Model 'Order' dari Mongoose, bukan file-based DB
-const { Order } = require('./db');
+const { Order , slimPaymentDetails } = require('./db');
 
 function createSignature({
     path,
@@ -137,7 +137,10 @@ async function checkPaymentStatus(orderId) {
             if (order.status === "PENDING") {
                 order.status = "PAID";
                 order.paidAt = new Date();
-                order.paymentDetails = data.data;
+                // HEMAT STORAGE: simpan ringkasan saja, bukan payload mentah.
+                order.paymentDetails = slimPaymentDetails(data.data);
+                // Order lunas tidak boleh ikut terhapus TTL.
+                order.expiresAt = undefined;
                 await order.save();
             }
             return { status: "PAID", order: order };

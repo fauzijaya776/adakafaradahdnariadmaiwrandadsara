@@ -4,6 +4,7 @@ const {
 const {
   Product
 } = require('./db');
+const mongoose = require('mongoose');
 const {
   createTransfer,
   getProfile
@@ -79,6 +80,7 @@ async function getAdminMenuMessageAndKeyboard() {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('➕ Tambah Stok', 'admin_add_stock_select_product_1')],
+    [Markup.button.callback('📤 Ambil Stok', 'ats_prod_1')],
     [Markup.button.callback('➕ Tambah Produk', 'admin_add_product')],
     [Markup.button.callback('✍️ Edit Produk', 'admin_edit_product_list_1')],
     [Markup.button.callback('💰 Harga Grosir', 'admin_bulk_select_product_1')],
@@ -278,6 +280,280 @@ async function getAddStockVariantList(productId, page = 1) {
   };
 }
 
+
+// =================================================================
+// AMBIL STOK MANUAL (khusus admin Telegram)
+// =================================================================
+// Menggantikan kebutuhan login ke MongoDB Atlas hanya untuk mengambil akun.
+// Semua handler di bawah dijaga adminMiddleware, jadi hanya ID Telegram yang
+// terdaftar di OWNER_ID yang bisa memakainya.
+
+// Escape karakter Markdown supaya nama produk ber-underscore tidak merusak pesan.
+function esc(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .replace(/([_*`\[\]])/g, '\\$1');
+}
+
+// Simpanan sementara untuk tombol undo. Sengaja di memori (bukan MongoDB)
+// supaya tidak memakan kuota 512MB. Hilang kalau bot restart.
+const lastTakenStock = new Map();
+const UNDO_LIMIT = 20;
+
+function rememberTaken(entry) {
+  const token = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  lastTakenStock.set(token, entry);
+  while (lastTakenStock.size > UNDO_LIMIT) {
+    lastTakenStock.delete(lastTakenStock.keys().next().value);
+  }
+  return token;
+}
+
+// Pengambilan stok yang AMAN dari race condition.
+// Tanpa transaksi, kalau ada customer checkout di detik yang sama, akun yang
+// sama bisa terkirim ke dua pihak sekaligus. Pola transaksi ini sama persis
+// dengan yang dipakai alur pembelian di all.js.
+async function takeStockAtomic(productId, variantSlug, count) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const product = await Product.findOne({ id: productId }).session(session);
+    if (!product) throw new Error('Produk tidak ditemukan.');
+
+    const variant = product.variants.find(v => v.slug === variantSlug);
+    if (!variant) throw new Error('Varian tidak ditemukan.');
+
+    const available = Array.isArray(variant.stock) ? variant.stock.length : 0;
+    if (available < count) {
+      throw new Error(`Stok tidak mencukupi. Tersisa ${available}, diminta ${count}.`);
+    }
+
+    const taken = variant.stock.splice(0, count);
+    await product.save({ session });
+    await session.commitTransaction();
+
+    return {
+      taken,
+      remaining: variant.stock.length,
+      productName: product.name,
+      variantName: variant.name
+    };
+  } catch (error) {
+    try { await session.abortTransaction(); } catch (e) {}
+    throw error;
+  } finally {
+    session.endSession();
+  }
+}
+
+// Kembalikan akun ke posisi semula (paling depan antrean stok).
+async function returnStockItems(productId, variantSlug, items) {
+  const result = await Product.updateOne(
+    { id: productId, 'variants.slug': variantSlug },
+    { $push: { 'variants.$.stock': { $each: items, $position: 0 } } }
+  );
+  return result.modifiedCount > 0;
+}
+
+async function getTakeStockProductList(page = 1) {
+  const products = await Product.find({}).sort({ name: 1 }).lean();
+  const perPage = 5;
+  const startIndex = (page - 1) * perPage;
+  const paginated = products.slice(startIndex, startIndex + perPage);
+
+  let message = '📤 *Ambil Stok*\n\nPilih produk yang stoknya mau diambil:\n\n';
+  const numberButtons = [];
+
+  if (paginated.length === 0) {
+    message += '_Belum ada produk._';
+  } else {
+    paginated.forEach((p, index) => {
+      const productNumber = startIndex + index + 1;
+      const totalStock = (p.variants || []).reduce(
+        (sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
+      message += `*${productNumber}. ${esc(p.name)}* — total ${totalStock}\n`;
+      numberButtons.push(Markup.button.callback(String(productNumber), `ats_var_${p.id}_1`));
+    });
+  }
+
+  const navigationButtons = [];
+  if (page > 1) navigationButtons.push(Markup.button.callback('⬅️', `ats_prod_${page - 1}`));
+  if (startIndex + perPage < products.length) navigationButtons.push(Markup.button.callback('➡️', `ats_prod_${page + 1}`));
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([
+      numberButtons,
+      navigationButtons,
+      [Markup.button.callback('⬅️ Batal', 'admin_menu')]
+    ])
+  };
+}
+
+async function getTakeStockVariantList(productId, page = 1) {
+  const product = await Product.findOne({ id: productId }).lean();
+  if (!product) {
+    return {
+      message: '❌ Produk tidak ditemukan.',
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'ats_prod_1')]])
+    };
+  }
+
+  const perPage = 5;
+  const startIndex = (page - 1) * perPage;
+  const variants = product.variants || [];
+  const paginated = variants.slice(startIndex, startIndex + perPage);
+
+  const message = `📤 *Ambil Stok: ${esc(product.name)}*\n\nPilih varian:`;
+  const variantButtons = paginated.map(v => {
+    const stockCount = Array.isArray(v.stock) ? v.stock.length : 0;
+    return [Markup.button.callback(`${v.name} (Stok: ${stockCount})`, `ats_qty:${product.id}:${v.slug}`)];
+  });
+
+  const navigationButtons = [];
+  if (page > 1) navigationButtons.push(Markup.button.callback('⬅️', `ats_var_${productId}_${page - 1}`));
+  if (startIndex + perPage < variants.length) navigationButtons.push(Markup.button.callback('➡️', `ats_var_${productId}_${page + 1}`));
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([
+      ...variantButtons,
+      navigationButtons,
+      [Markup.button.callback('⬅️ Kembali ke Produk', 'ats_prod_1')]
+    ])
+  };
+}
+
+async function getTakeStockQuantityScreen(productId, variantSlug) {
+  const product = await Product.findOne({ id: productId }).lean();
+  const variant = product && (product.variants || []).find(v => v.slug === variantSlug);
+
+  if (!variant) {
+    return {
+      message: '❌ Varian tidak ditemukan.',
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'ats_prod_1')]])
+    };
+  }
+
+  const available = Array.isArray(variant.stock) ? variant.stock.length : 0;
+  const message = `📤 *Ambil Stok*\n\n` +
+    `*Produk:* ${esc(product.name)}\n` +
+    `*Varian:* ${esc(variant.name)}\n` +
+    `*Stok tersedia:* ${available}\n\n` +
+    (available === 0 ? '_Stok kosong, tidak ada yang bisa diambil._' : 'Mau ambil berapa akun?');
+
+  const rows = [];
+  if (available > 0) {
+    const presets = [1, 5, 10, 25, 50].filter(n => n <= available);
+    for (let i = 0; i < presets.length; i += 3) {
+      rows.push(presets.slice(i, i + 3).map(n =>
+        Markup.button.callback(String(n), `ats_ok:${productId}:${variantSlug}:${n}`)));
+    }
+    rows.push([
+      Markup.button.callback(`📦 Semua (${available})`, `ats_ok:${productId}:${variantSlug}:${available}`),
+      Markup.button.callback('✏️ Ketik jumlah', `ats_custom:${productId}:${variantSlug}`)
+    ]);
+  }
+  rows.push([Markup.button.callback('⬅️ Kembali', `ats_var_${productId}_1`)]);
+
+  return { message, keyboard: Markup.inlineKeyboard(rows) };
+}
+
+async function getTakeStockConfirmScreen(productId, variantSlug, count) {
+  const product = await Product.findOne({ id: productId }).lean();
+  const variant = product && (product.variants || []).find(v => v.slug === variantSlug);
+
+  if (!variant) {
+    return {
+      message: '❌ Varian tidak ditemukan.',
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'ats_prod_1')]])
+    };
+  }
+
+  const available = Array.isArray(variant.stock) ? variant.stock.length : 0;
+  if (count > available) {
+    return {
+      message: `❌ Stok tidak cukup.\n\nDiminta: ${count}\nTersedia: ${available}`,
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', `ats_qty:${productId}:${variantSlug}`)]])
+    };
+  }
+
+  const message = `⚠️ *Konfirmasi Ambil Stok*\n\n` +
+    `*Produk:* ${esc(product.name)}\n` +
+    `*Varian:* ${esc(variant.name)}\n` +
+    `*Jumlah diambil:* ${count}\n` +
+    `*Sisa setelah diambil:* ${available - count}\n\n` +
+    `_Akun akan dihapus dari database dan dikirim ke sini._`;
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Ya, ambil sekarang', `ats_go:${productId}:${variantSlug}:${count}`)],
+      [Markup.button.callback('⬅️ Batal', `ats_qty:${productId}:${variantSlug}`)]
+    ])
+  };
+}
+
+// Eksekusi + kirim hasilnya ke admin.
+async function performTakeStock(ctx, productId, variantSlug, count) {
+  let outcome;
+  try {
+    outcome = await takeStockAtomic(productId, variantSlug, count);
+  } catch (error) {
+    console.error('Ambil stok gagal:', error.message);
+    await ctx.reply(`❌ Gagal mengambil stok.\n\n${error.message}`);
+    return;
+  }
+
+  const token = rememberTaken({
+    productId, variantSlug,
+    items: outcome.taken,
+    productName: outcome.productName,
+    variantName: outcome.variantName
+  });
+
+  const header = `✅ *Berhasil Ambil Stok*\n\n` +
+    `*Produk:* ${esc(outcome.productName)}\n` +
+    `*Varian:* ${esc(outcome.variantName)}\n` +
+    `*Diambil:* ${outcome.taken.length}\n` +
+    `*Sisa stok:* ${outcome.remaining}`;
+
+  const undoKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('↩️ Kembalikan ke stok', `ats_undo:${token}`)],
+    [Markup.button.callback('📤 Ambil lagi', `ats_qty:${productId}:${variantSlug}`)],
+    [Markup.button.callback('⬅️ Menu Admin', 'admin_menu')]
+  ]);
+
+  // Di bawah 10 akun dikirim inline agar gampang disalin; 10 ke atas jadi file
+  // .txt (sama seperti alur pembelian customer).
+  if (outcome.taken.length < 10) {
+    const list = outcome.taken.map((item, i) => `${i + 1}. ${item}`).join('\n');
+    await ctx.reply(header + '\n\n```\n' + list + '\n```', {
+      parse_mode: 'Markdown', reply_markup: undoKeyboard.reply_markup
+    });
+  } else {
+    await ctx.reply(header, { parse_mode: 'Markdown', reply_markup: undoKeyboard.reply_markup });
+    await ctx.replyWithDocument({
+      source: Buffer.from(outcome.taken.join('\n'), 'utf-8'),
+      filename: `ambil_${productId}_${variantSlug}_${outcome.taken.length}.txt`
+    });
+  }
+}
+
+// Dipanggil all.js saat admin mengetik jumlah custom.
+async function handleTakeStockCount(ctx, userState) {
+  const raw = (ctx.message.text || '').trim();
+  const count = parseInt(raw, 10);
+
+  if (!/^\d+$/.test(raw) || isNaN(count) || count <= 0) {
+    await ctx.reply('❌ Masukkan angka positif saja, contoh: `15`', { parse_mode: 'Markdown' });
+    return false; // state dipertahankan supaya admin bisa coba lagi
+  }
+
+  const { message, keyboard } = await getTakeStockConfirmScreen(
+    userState.productId, userState.variantSlug, count);
+  await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+  return true;
+}
 
 module.exports = (bot) => {
   bot.command('admin', adminMiddleware, async (ctx) => {
@@ -652,6 +928,132 @@ bot.action('confirm_transfer_no', adminMiddleware, async (ctx) => {
     });
   });
 
+  // ---------------- AMBIL STOK (admin Telegram saja) ----------------
+  const editScreen = async (ctx, screen) => {
+    try {
+      await ctx.editMessageText(screen.message, {
+        parse_mode: 'Markdown', reply_markup: screen.keyboard.reply_markup
+      });
+    } catch (error) {
+      const description = String((error && error.description) || (error && error.message) || '');
+      if (description.includes('message is not modified')) return;
+      // Pesan lama tidak bisa diedit -> kirim baru supaya tombolnya tidak mati.
+      await ctx.reply(screen.message, {
+        parse_mode: 'Markdown', reply_markup: screen.keyboard.reply_markup
+      });
+    }
+  };
+
+  bot.action(/^ats_prod_(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await editScreen(ctx, await getTakeStockProductList(parseInt(ctx.match[1], 10)));
+    } catch (error) {
+      console.error('Error ats_prod:', error);
+      await ctx.reply('❌ Gagal memuat daftar produk.');
+    }
+  });
+
+  bot.action(/^ats_var_(.+?)_(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await editScreen(ctx, await getTakeStockVariantList(ctx.match[1], parseInt(ctx.match[2], 10)));
+    } catch (error) {
+      console.error('Error ats_var:', error);
+      await ctx.reply('❌ Gagal memuat daftar varian.');
+    }
+  });
+
+  bot.action(/^ats_qty:(.+?):(.*)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      delete userStates[ctx.from.id];
+      await editScreen(ctx, await getTakeStockQuantityScreen(ctx.match[1], ctx.match[2]));
+    } catch (error) {
+      console.error('Error ats_qty:', error);
+      await ctx.reply('❌ Gagal memuat pilihan jumlah.');
+    }
+  });
+
+  bot.action(/^ats_custom:(.+?):(.*)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      const productId = ctx.match[1];
+      const variantSlug = ctx.match[2];
+      userStates[ctx.from.id] = { state: 'awaiting_take_stock_count', productId, variantSlug };
+      await editScreen(ctx, {
+        message: '✏️ *Ketik jumlah akun yang mau diambil*\n\nContoh: `15`\n\n_Kirim angkanya sebagai pesan biasa._',
+        keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Batal', `ats_qty:${productId}:${variantSlug}`)]])
+      });
+    } catch (error) {
+      console.error('Error ats_custom:', error);
+      await ctx.reply('❌ Gagal memproses pilihan.');
+    }
+  });
+
+  bot.action(/^ats_ok:(.+?):(.+?):(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await editScreen(ctx, await getTakeStockConfirmScreen(
+        ctx.match[1], ctx.match[2], parseInt(ctx.match[3], 10)));
+    } catch (error) {
+      console.error('Error ats_ok:', error);
+      await ctx.reply('❌ Gagal memuat konfirmasi.');
+    }
+  });
+
+  bot.action(/^ats_go:(.+?):(.+?):(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery('⏳ Mengambil stok...');
+      delete userStates[ctx.from.id];
+      // Tombol konfirmasi dilepas dulu supaya tidak bisa dipencet dua kali.
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
+      await performTakeStock(ctx, ctx.match[1], ctx.match[2], parseInt(ctx.match[3], 10));
+    } catch (error) {
+      console.error('Error ats_go:', error);
+      await ctx.reply('❌ Terjadi kesalahan saat mengambil stok.');
+    }
+  });
+
+  bot.action(/^ats_undo:(.+)$/, adminMiddleware, async (ctx) => {
+    try {
+      const token = ctx.match[1];
+      const entry = lastTakenStock.get(token);
+
+      if (!entry) {
+        await ctx.answerCbQuery('Sudah dikembalikan, atau bot sempat restart.', { show_alert: true });
+        return;
+      }
+      // Hapus token DULU supaya klik ganda tidak mengembalikan dua kali.
+      lastTakenStock.delete(token);
+      await ctx.answerCbQuery('⏳ Mengembalikan...');
+
+      const restored = await returnStockItems(entry.productId, entry.variantSlug, entry.items);
+      if (!restored) {
+        lastTakenStock.set(token, entry);
+        await ctx.reply('❌ Gagal mengembalikan stok. Produk atau varian mungkin sudah dihapus.');
+        return;
+      }
+
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
+      await ctx.reply(
+        `↩️ *Stok Dikembalikan*\n\n` +
+        `*Produk:* ${esc(entry.productName)}\n` +
+        `*Varian:* ${esc(entry.variantName)}\n` +
+        `*Jumlah:* ${entry.items.length} akun kembali ke stok.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('⬅️ Menu Admin', 'admin_menu')]
+          ]).reply_markup
+        }
+      );
+    } catch (error) {
+      console.error('Error ats_undo:', error);
+      await ctx.reply('❌ Terjadi kesalahan saat mengembalikan stok.');
+    }
+  });
+
   bot.action(/^admin_add_stock_select_product_(\d+)$/,
     adminMiddleware,
     async (ctx) => {
@@ -992,3 +1394,5 @@ module.exports.getAdminMenuMessageAndKeyboard = getAdminMenuMessageAndKeyboard;
 module.exports.addStock = addStock;
 module.exports.userStates = userStates;
 module.exports.adminMiddleware = adminMiddleware;
+module.exports.handleTakeStockCount = handleTakeStockCount;
+module.exports.takeStockAtomic = takeStockAtomic;

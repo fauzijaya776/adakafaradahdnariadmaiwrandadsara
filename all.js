@@ -502,28 +502,30 @@ app.get('/broadcast', authMiddleware, async (req, res) => {
 app.post('/broadcast/send', authMiddleware, upload.single('image_file'), async (req, res) => {
     const { broadcast_type, content, image_url, image_source } = req.body;
     try {
-        const users = await User.find({}, 'id');
-        const userIds = users.map(user => user.id);
-        let successCount = 0;
-        let failCount = 0;
-        for (const userId of userIds) {
-            try {
-                if (broadcast_type === 'text_only') {
-                    await bot.telegram.sendMessage(userId, content, { parse_mode: 'Markdown' });
-                } else if (broadcast_type === 'image_with_text') {
-                    let imageToSend = (image_source === 'url') ? image_url : { source: path.join(__dirname, 'public', 'uploads', req.file.filename) };
-                    await bot.telegram.sendPhoto(userId, imageToSend, { caption: content, parse_mode: 'Markdown' });
-                }
-                successCount++;
-            } catch (e) {
-                console.error(`Failed to send broadcast to ${userId}:`, e.message);
-                failCount++;
-            }
-        }
+        const photo = (broadcast_type === 'image_with_text')
+            ? ((image_source === 'url')
+                ? image_url
+                : { source: path.join(__dirname, 'public', 'uploads', req.file.filename) })
+            : null;
+
+        // Memakai mesin broadcast yang sama dengan bot: ada jeda antar kirim
+        // (anti 429), fallback teks biasa kalau Markdown rusak, dan daftar
+        // stok + tombol beli otomatis ikut terkirim.
+        const result = await runBroadcast(bot.telegram, {
+            text: content,
+            photo,
+            attachStock: true
+        });
+
         if (req.file) {
-            await fs.unlink(req.file.path);
+            await fs.unlink(req.file.path).catch(() => {});
         }
-        res.redirect(`/broadcast?success=Broadcast sent to ${successCount} users. Failed for ${failCount} users.`);
+
+        let summary = `Broadcast terkirim ke ${result.success} dari ${result.total} user.`;
+        summary += ` Memblokir bot: ${result.blocked}. Gagal lain: ${result.failed}.`;
+        if (result.stockAttached) summary += ' Daftar stok + tombol beli ikut terkirim.';
+        if (result.markdownDisabled) summary += ' (Markdown tidak valid, dikirim sebagai teks biasa.)';
+        res.redirect(`/broadcast?success=${encodeURIComponent(summary)}`);
     } catch (error) {
         console.error('Broadcast error:', error);
         res.redirect(`/broadcast?error=An error occurred during broadcast.`);
@@ -808,6 +810,180 @@ async function generateStockTextMessage() {
     return message;
 }
 
+// =============================================================
+// MESIN BROADCAST
+// =============================================================
+// Telegram membatasi bot ~30 pesan/detik untuk pengiriman massal. Loop lama
+// mengirim tanpa jeda sama sekali sehingga kena 429 (Too Many Requests), dan
+// error itu merembet ke pesan status di akhir -> muncul "Terjadi kesalahan"
+// padahal pesannya sendiri sudah terkirim.
+const BROADCAST_DELAY_MS = parseInt(process.env.BROADCAST_DELAY_MS || '40', 10);
+const TELEGRAM_TEXT_LIMIT = 4096;
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+const broadcastSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Dipakai saat Markdown terpaksa dimatikan: buang penanda format supaya user
+// tidak melihat bintang dan backtick mentah di pesannya.
+function toPlainText(text) {
+    return String(text || '')
+        .replace(/\\([_*`\[\]])/g, '$1')
+        .replace(/[*`]/g, '');
+}
+
+// Telegraf menaruh detail error di tempat berbeda tergantung versi.
+function telegramErrorInfo(error) {
+    const response = (error && error.response) || {};
+    const parameters = response.parameters || (error && error.parameters) || {};
+    return {
+        code: response.error_code || (error && error.code),
+        description: String(response.description || (error && error.description) || (error && error.message) || ''),
+        retryAfter: parameters.retry_after
+    };
+}
+
+// Kirim satu pesan dengan penanganan 429 (tunggu sesuai perintah Telegram)
+// dan Markdown rusak (kirim ulang sebagai teks biasa).
+async function sendWithRetry(chatId, sendFn, state) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            await sendFn(state.useMarkdown);
+            return { ok: true };
+        } catch (error) {
+            const info = telegramErrorInfo(error);
+
+            // 429: Telegram memberi tahu harus menunggu berapa detik.
+            if (info.code === 429 && info.retryAfter) {
+                await broadcastSleep((info.retryAfter + 1) * 1000);
+                continue;
+            }
+            // Markdown admin tidak valid -> matikan Markdown untuk sisa broadcast
+            // supaya pesan tetap sampai, bukan gagal semua.
+            if (info.description.includes('parse entities') && state.useMarkdown) {
+                state.useMarkdown = false;
+                state.markdownDisabled = true;
+                continue;
+            }
+            // User memblokir bot / akun dihapus: kegagalan permanen, bukan error.
+            if (info.code === 403 ||
+                info.description.includes('bot was blocked') ||
+                info.description.includes('user is deactivated') ||
+                info.description.includes('chat not found')) {
+                return { ok: false, blocked: true };
+            }
+            return { ok: false, error: info.description };
+        }
+    }
+    return { ok: false, error: 'gagal setelah percobaan ulang' };
+}
+
+// Jalankan broadcast ke semua user, lengkap dengan daftar stok + tombol beli.
+// Mengembalikan ringkasan; TIDAK pernah melempar error ke pemanggil.
+async function runBroadcast(telegram, options) {
+    const opts = options || {};
+    const text = opts.text || '';
+    const photo = opts.photo || null;
+    const attachStock = opts.attachStock !== false;
+    const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+
+    const result = {
+        total: 0, success: 0, failed: 0, blocked: 0,
+        markdownDisabled: false, stockAttached: false
+    };
+
+    // Daftar stok dihitung SEKALI saja, bukan per user.
+    let stockMessage = null;
+    let stockKeyboard = null;
+    if (attachStock) {
+        try {
+            const stock = await generateStockMessageAndKeyboard();
+            stockMessage = stock.message;
+            stockKeyboard = stock.keyboard;
+            result.stockAttached = true;
+        } catch (error) {
+            console.error('Broadcast: gagal memuat daftar stok:', error.message);
+        }
+    }
+
+    // Kalau muat, gabungkan jadi SATU pesan supaya user tidak dapat 2 notifikasi.
+    const combined = (text && stockMessage) ? (text + '\n\n' + stockMessage) : null;
+    const canCombine = !photo && combined !== null && combined.length <= TELEGRAM_TEXT_LIMIT - 96;
+
+    const users = await User.find({ id: { $exists: true, $ne: null } }, 'id').lean();
+    const userIds = users.map((u) => u.id).filter(Boolean);
+    result.total = userIds.length;
+
+    const state = { useMarkdown: true, markdownDisabled: false };
+
+    for (let i = 0; i < userIds.length; i++) {
+        const chatId = userIds[i];
+        let delivered = false;
+        let blocked = false;
+
+        // --- Pesan utama ---
+        if (photo) {
+            const caption = text.length > TELEGRAM_CAPTION_LIMIT
+                ? text.slice(0, TELEGRAM_CAPTION_LIMIT - 1)
+                : text;
+            const outcome = await sendWithRetry(chatId, (useMarkdown) =>
+                telegram.sendPhoto(chatId, photo, useMarkdown
+                    ? { caption, parse_mode: 'Markdown' }
+                    : { caption: toPlainText(caption) }), state);
+            delivered = outcome.ok;
+            blocked = !!outcome.blocked;
+        } else {
+            const body = canCombine ? combined : text;
+            const extra = (canCombine && stockKeyboard)
+                ? { reply_markup: stockKeyboard.reply_markup }
+                : {};
+            const outcome = await sendWithRetry(chatId, (useMarkdown) =>
+                telegram.sendMessage(chatId, useMarkdown ? body : toPlainText(body), useMarkdown
+                    ? Object.assign({ parse_mode: 'Markdown' }, extra)
+                    : Object.assign({}, extra)), state);
+            delivered = outcome.ok;
+            blocked = !!outcome.blocked;
+        }
+
+        // --- Daftar stok sebagai pesan kedua (kalau tidak muat digabung) ---
+        if (delivered && stockMessage && !canCombine) {
+            await broadcastSleep(BROADCAST_DELAY_MS);
+            await sendWithRetry(chatId, (useMarkdown) =>
+                telegram.sendMessage(chatId, useMarkdown ? stockMessage : toPlainText(stockMessage), useMarkdown
+                    ? { parse_mode: 'Markdown', reply_markup: stockKeyboard.reply_markup }
+                    : { reply_markup: stockKeyboard.reply_markup }), state);
+        }
+
+        if (delivered) result.success += 1;
+        else if (blocked) result.blocked += 1;
+        else result.failed += 1;
+
+        if (onProgress && (i + 1) % 50 === 0) {
+            try { await onProgress(i + 1, result); } catch (e) {}
+        }
+
+        // Jeda antar user: inilah yang mencegah 429.
+        if (i < userIds.length - 1) await broadcastSleep(BROADCAST_DELAY_MS);
+    }
+
+    result.markdownDisabled = state.markdownDisabled;
+    return result;
+}
+
+function formatBroadcastSummary(result) {
+    let summary = `🚀 *Broadcast Selesai*\n\n` +
+        `✅ Berhasil terkirim: ${result.success} pengguna\n` +
+        `🚫 Memblokir bot / akun hilang: ${result.blocked} pengguna\n` +
+        `❌ Gagal lain: ${result.failed} pengguna\n` +
+        `👥 Total user: ${result.total}`;
+    if (result.stockAttached) {
+        summary += `\n\n📦 Daftar stok + tombol beli ikut terkirim.`;
+    }
+    if (result.markdownDisabled) {
+        summary += `\n\n⚠️ Format Markdown pesanmu tidak valid, jadi pesan dikirim sebagai teks biasa.`;
+    }
+    return summary;
+}
+
 async function generateProductDetailsMessageAndKeyboard(productId, page) {
     try {
         const product = await Product.findOne({ id: productId }).lean();
@@ -1033,7 +1209,10 @@ bot.action(/^list_products_(\d+)$/, async (ctx) => {
             if (ctx.callbackQuery.message.photo) {
                 await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
             } else {
-                await ctx.deleteMessage();
+                // Bot hanya boleh menghapus pesannya sendiri dalam 48 jam.
+                // Pesan broadcast lama akan gagal dihapus -> jangan sampai
+                // itu membuat tombolnya mati.
+                await ctx.deleteMessage().catch(() => {});
                 await ctx.replyWithPhoto(
                     { source: imagePath },
                     { caption: message, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
@@ -1074,14 +1253,24 @@ bot.action(/^show_product_([^_]+)_page_(\d+)$/, async (ctx) => {
         const productId = ctx.match[1];
         const page = parseInt(ctx.match[2]);
         const { message, keyboard } = await generateProductDetailsMessageAndKeyboard(productId, page);
-        
-        if (ctx.callbackQuery.message.photo) {
-            await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
-        } else {
-            await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+
+        try {
+            if (ctx.callbackQuery.message.photo) {
+                await ctx.editMessageCaption(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            } else {
+                await ctx.editMessageText(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            }
+        } catch (editError) {
+            // Pesan broadcast bisa saja sudah tidak bisa diedit (terlalu lama /
+            // sudah dihapus). Jangan biarkan tombolnya terasa mati: kirim
+            // pesan baru saja.
+            const info = telegramErrorInfo(editError);
+            if (info.description.includes('message is not modified')) return;
+            await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
         }
     } catch (error) {
         console.error('Error in show_product_details:', error);
+        try { await ctx.answerCbQuery('❌ Gagal memuat produk.', { show_alert: true }); } catch (e) {}
     }
 });
 
@@ -2123,32 +2312,37 @@ bot.hears(/^[^\/]/, async (ctx) => {
         } else if (userState.state === 'awaiting_broadcast_message') {
             const message = ctx.message.text;
             delete userStates[userId];
-            
-            const statusMessage = await ctx.reply('Mengirim broadcast...');
-            const allUsers = await User.find({}, 'id').lean();
-            const userIds = allUsers.map(user => user.id);
-            
-            let successCount = 0;
-            let failCount = 0;
-            
-            for (const id of userIds) {
+
+            const statusMessage = await ctx.reply('⏳ Menyiapkan broadcast...');
+
+            // Helper edit status yang TIDAK PERNAH melempar error. Inilah bug
+            // lamanya: edit status gagal (biasanya 429 setelah kirim massal),
+            // errornya naik ke catch besar, dan admin melihat
+            // "Terjadi kesalahan" padahal broadcast-nya sukses terkirim.
+            const updateStatus = async (text) => {
                 try {
-                    await ctx.telegram.sendMessage(id, message, { parse_mode: 'Markdown' });
-                    successCount++;
-                } catch (e) {
-                    failCount++;
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id, statusMessage.message_id, null, text,
+                        { parse_mode: 'Markdown' }
+                    );
+                } catch (editError) {
+                    const info = telegramErrorInfo(editError);
+                    if (!info.description.includes('message is not modified')) {
+                        console.error('Broadcast: gagal update status:', info.description);
+                    }
                 }
-            }
-            
-            await ctx.telegram.editMessageText(
-                ctx.chat.id, 
-                statusMessage.message_id, 
-                null, 
-                `🚀 *Broadcast Selesai*\n\n` +
-                `✅ Berhasil terkirim: ${successCount} pengguna\n` +
-                `❌ Gagal terkirim: ${failCount} pengguna`, 
-                { parse_mode: 'Markdown' }
-            );
+            };
+
+            const result = await runBroadcast(ctx.telegram, {
+                text: message,
+                attachStock: true,
+                onProgress: (done, running) => updateStatus(
+                    `⏳ *Mengirim broadcast...*\n\n` +
+                    `Terkirim: ${running.success} / ${running.total}`
+                )
+            });
+
+            await updateStatus(formatBroadcastSummary(result));
             
         } else if (userState.state === 'awaiting_snk') {
             const newSnk = ctx.message.text;

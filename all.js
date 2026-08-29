@@ -986,6 +986,12 @@ bot.action('back_to_start', async (ctx) => {
     }
 });
 
+// Tombol angka di antara ➖ dan ➕ hanya penanda, bukan aksi. Tanpa handler,
+// Telegram tidak pernah dapat balasan dan spinner-nya berputar sampai timeout.
+bot.action('ignore_me', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch (e) {}
+});
+
 bot.action(/^show_product_([^_]+)_page_(\d+)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -1975,7 +1981,19 @@ bot.hears(/^[^\/]/, async (ctx) => {
     if (!userState) return;
     
     try {
-        if (userState.state === 'awaiting_take_stock_count') {
+        if (userState.state === 'awaiting_variant_price') {
+            // Admin mengetik harga baru untuk varian.
+            const done = await adminModule.handleVariantPriceInput(ctx, userState);
+            if (done) delete userStates[userId];
+            return;
+
+        } else if (userState.state === 'awaiting_variant_name') {
+            // Admin mengetik nama baru untuk varian.
+            const done = await adminModule.handleVariantNameInput(ctx, userState);
+            if (done) delete userStates[userId];
+            return;
+
+        } else if (userState.state === 'awaiting_take_stock_count') {
             // Admin mengetik jumlah akun yang mau diambil.
             const done = await adminModule.handleTakeStockCount(ctx, userState);
             if (done) delete userStates[userId];

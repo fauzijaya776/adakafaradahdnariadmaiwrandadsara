@@ -539,6 +539,104 @@ async function performTakeStock(ctx, productId, variantSlug, count) {
   }
 }
 
+// =================================================================
+// EDIT VARIAN (nama / harga)
+// =================================================================
+async function getEditVariantMenu(productId, variantSlug, page) {
+  const product = await Product.findOne({ id: productId }).lean();
+  const variant = product && (product.variants || []).find(v => v.slug === variantSlug);
+
+  if (!variant) {
+    return {
+      message: '❌ Varian tidak ditemukan.',
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', `admin_edit_product_${productId}_page_${page}`)]])
+    };
+  }
+
+  const stockCount = Array.isArray(variant.stock) ? variant.stock.length : 0;
+  const message = `📝 *Edit Varian*\n\n` +
+    `*Produk:* ${esc(product.name)}\n` +
+    `*Varian:* ${esc(variant.name)}\n` +
+    `*Harga sekarang:* Rp ${Number(variant.price || 0).toLocaleString('id-ID')}\n` +
+    `*Stok:* ${stockCount}\n\n` +
+    `Mau ubah yang mana?`;
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([
+      [Markup.button.callback('💰 Ubah Harga', `ev_price:${productId}:${variantSlug}:${page}`)],
+      [Markup.button.callback('✏️ Ubah Nama', `ev_name:${productId}:${variantSlug}:${page}`)],
+      [Markup.button.callback('⬅️ Kembali', `admin_edit_product_${productId}_page_${page}`)]
+    ])
+  };
+}
+
+// Terima harga baru. Mengembalikan true kalau state boleh dibersihkan.
+async function handleVariantPriceInput(ctx, userState) {
+  const raw = (ctx.message.text || '').trim().replace(/[.,\s]/g, '');
+
+  if (!/^\d+$/.test(raw) || parseInt(raw, 10) <= 0) {
+    await ctx.reply('❌ Harga harus angka positif. Contoh: `20000`', { parse_mode: 'Markdown' });
+    return false;
+  }
+
+  const newPrice = parseInt(raw, 10);
+  const result = await Product.updateOne(
+    { id: userState.productId, 'variants.slug': userState.variantSlug },
+    { $set: { 'variants.$.price': newPrice } }
+  );
+
+  if (result.matchedCount === 0) {
+    await ctx.reply('❌ Produk atau varian tidak ditemukan lagi.');
+    return true;
+  }
+
+  await ctx.reply(
+    `✅ *Harga berhasil diubah*\n\nHarga baru: Rp ${newPrice.toLocaleString('id-ID')}`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('📝 Edit varian ini lagi', `admin_edit_variant:${userState.productId}:${userState.variantSlug}:${userState.page || 1}`)],
+        [Markup.button.callback('⬅️ Kembali ke Produk', `admin_edit_product_${userState.productId}_page_${userState.page || 1}`)]
+      ]).reply_markup
+    }
+  );
+  return true;
+}
+
+// Terima nama varian baru. Slug sengaja TIDAK diubah supaya stok, pesanan
+// lama, dan tombol yang sudah beredar tetap menunjuk ke varian yang sama.
+async function handleVariantNameInput(ctx, userState) {
+  const newName = (ctx.message.text || '').trim();
+
+  if (newName.length === 0 || newName.length > 60) {
+    await ctx.reply('❌ Nama varian tidak boleh kosong dan maksimal 60 karakter.');
+    return false;
+  }
+
+  const result = await Product.updateOne(
+    { id: userState.productId, 'variants.slug': userState.variantSlug },
+    { $set: { 'variants.$.name': newName } }
+  );
+
+  if (result.matchedCount === 0) {
+    await ctx.reply('❌ Produk atau varian tidak ditemukan lagi.');
+    return true;
+  }
+
+  await ctx.reply(
+    `✅ *Nama varian berhasil diubah*\n\nNama baru: ${esc(newName)}`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('📝 Edit varian ini lagi', `admin_edit_variant:${userState.productId}:${userState.variantSlug}:${userState.page || 1}`)],
+        [Markup.button.callback('⬅️ Kembali ke Produk', `admin_edit_product_${userState.productId}_page_${userState.page || 1}`)]
+      ]).reply_markup
+    }
+  );
+  return true;
+}
+
 // Dipanggil all.js saat admin mengetik jumlah custom.
 async function handleTakeStockCount(ctx, userState) {
   const raw = (ctx.message.text || '').trim();
@@ -1280,26 +1378,89 @@ bot.action('confirm_transfer_no', adminMiddleware, async (ctx) => {
       );
     });
 
-  bot.action(/^admin_edit_variant_(.+)_(.*)_page_(\d+)$/,
+  // BUG FIX: tombol '📝 Edit Varian' mengirim pola titik dua
+  // (admin_edit_variant:produk:slug:halaman), tapi handler lama masih menunggu
+  // pola garis bawah (admin_edit_variant_produk_slug_page_1). Tidak ada yang
+  // cocok, jadi tombolnya mati total dan satu-satunya cara mengubah harga
+  // adalah membuat varian baru. Pola sekarang disamakan dengan tombolnya,
+  // sama seperti tombol Hapus di sebelahnya.
+  bot.action(/^admin_edit_variant:(.+?):(.+?):(\d+)$/,
     adminMiddleware,
     async (ctx) => {
+      try {
+        await ctx.answerCbQuery();
+        delete userStates[ctx.from.id];
+        const screen = await getEditVariantMenu(ctx.match[1], ctx.match[2], parseInt(ctx.match[3], 10));
+        await ctx.editMessageText(screen.message, {
+          parse_mode: 'Markdown', reply_markup: screen.keyboard.reply_markup
+        });
+      } catch (error) {
+        console.error('Error admin_edit_variant:', error);
+        await ctx.reply('❌ Gagal memuat menu edit varian.');
+      }
+    });
+
+  bot.action(/^ev_price:(.+?):(.+?):(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
       await ctx.answerCbQuery();
       const productId = ctx.match[1];
-      const page = parseInt(ctx.match[3]);
+      const variantSlug = ctx.match[2];
+      const page = parseInt(ctx.match[3], 10);
 
-      const message = 'Untuk mengedit varian, silakan kirim format berikut:\n\n' +
-      '`editvarian <id_produk> | <slug_varian> | <nama> | <harga>`\n\n' +
-      'Contoh:\n' +
-      '`editvarian spotify | 1_bulan | 1 Bulan | 20000`';
+      const product = await Product.findOne({ id: productId }).lean();
+      const variant = product && (product.variants || []).find(v => v.slug === variantSlug);
+      if (!variant) return await ctx.editMessageText('❌ Varian tidak ditemukan.');
 
-      const keyboard = Markup.inlineKeyboard([
-        Markup.button.callback('⬅️ Kembali', `admin_edit_product_${productId}_page_${page}`)
-      ]);
+      userStates[ctx.from.id] = { state: 'awaiting_variant_price', productId, variantSlug, page };
 
-      await ctx.editMessageText(message, {
-        parse_mode: 'Markdown', reply_markup: keyboard.reply_markup
-      });
-    });
+      await ctx.editMessageText(
+        `💰 *Ubah Harga*\n\n` +
+        `*Varian:* ${esc(variant.name)}\n` +
+        `*Harga sekarang:* Rp ${Number(variant.price || 0).toLocaleString('id-ID')}\n\n` +
+        `Kirim harga barunya sebagai angka saja.\nContoh: \`20000\``,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('⬅️ Batal', `admin_edit_variant:${productId}:${variantSlug}:${page}`)]
+          ]).reply_markup
+        }
+      );
+    } catch (error) {
+      console.error('Error ev_price:', error);
+      await ctx.reply('❌ Gagal membuka ubah harga.');
+    }
+  });
+
+  bot.action(/^ev_name:(.+?):(.+?):(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      const productId = ctx.match[1];
+      const variantSlug = ctx.match[2];
+      const page = parseInt(ctx.match[3], 10);
+
+      const product = await Product.findOne({ id: productId }).lean();
+      const variant = product && (product.variants || []).find(v => v.slug === variantSlug);
+      if (!variant) return await ctx.editMessageText('❌ Varian tidak ditemukan.');
+
+      userStates[ctx.from.id] = { state: 'awaiting_variant_name', productId, variantSlug, page };
+
+      await ctx.editMessageText(
+        `✏️ *Ubah Nama Varian*\n\n` +
+        `*Nama sekarang:* ${esc(variant.name)}\n\n` +
+        `Kirim nama barunya.\nContoh: \`1 Bulan Sharing\`\n\n` +
+        `_Slug tidak ikut berubah, jadi stok dan pesanan lama tetap aman._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('⬅️ Batal', `admin_edit_variant:${productId}:${variantSlug}:${page}`)]
+          ]).reply_markup
+        }
+      );
+    } catch (error) {
+      console.error('Error ev_name:', error);
+      await ctx.reply('❌ Gagal membuka ubah nama.');
+    }
+  });
 
   bot.action(/^admin_delete_product_(.+?)_page_(\d+)$/,
     adminMiddleware,
@@ -1395,4 +1556,6 @@ module.exports.addStock = addStock;
 module.exports.userStates = userStates;
 module.exports.adminMiddleware = adminMiddleware;
 module.exports.handleTakeStockCount = handleTakeStockCount;
+module.exports.handleVariantPriceInput = handleVariantPriceInput;
+module.exports.handleVariantNameInput = handleVariantNameInput;
 module.exports.takeStockAtomic = takeStockAtomic;

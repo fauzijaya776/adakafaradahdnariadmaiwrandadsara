@@ -149,9 +149,36 @@ async function cancelTransaction(orderId, amount) {
   }
 }
 
+/**
+ * Simulasikan pembayaran (HANYA untuk project mode Sandbox di Pakasir).
+ * Dipakai oleh skrip tes; tidak dipakai di alur produksi.
+ */
+async function simulatePayment(orderId, amount) {
+  const { project, api_key } = getCreds();
+  try {
+    const response = await axios({
+      method: "post",
+      url: `${PAKASIR_BASE}/paymentsimulation`,
+      headers: { "Content-Type": "application/json" },
+      data: {
+        project: project,
+        order_id: String(orderId),
+        amount: parseInt(amount),
+        api_key: api_key,
+      },
+    });
+    return response.data;
+  } catch (error) {
+    const info = error.response ? { status: error.response.status, data: error.response.data } : error.message;
+    console.error("[PAKASIR SIMULATE ERROR]", info);
+    return null;
+  }
+}
+
 module.exports = {
   init: async () => console.log("[ Pakasir QRIS Payment System Initialized ]"),
   createTransaction,
   checkPaymentStatus,
   cancelTransaction,
+  simulatePayment,
 };

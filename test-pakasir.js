@@ -7,11 +7,14 @@
 //   4. Skrip akan polling status sampai "completed" (maks 3 menit).
 //
 // Nominal tes bisa diubah lewat argumen:  node test-pakasir.js 2500
+// Mode Sandbox: tambah kata "sim" untuk auto-simulasi bayar:
+//   node test-pakasir.js 1500 sim
 require("dotenv").config();
 const QRCode = require("qrcode");
 const pakasir = require("./qris_pakasir");
 
 const AMOUNT = parseInt(process.argv[2] || "1500", 10);
+const DO_SIM = (process.argv[3] || "").toLowerCase() === "sim";
 
 (async () => {
   console.log("=== TES INTEGRASI PAKASIR (QRIS) ===");
@@ -44,6 +47,12 @@ const AMOUNT = parseInt(process.argv[2] || "1500", 10);
 
   await QRCode.toFile("qris-test.png", raw.qrString, { width: 512, margin: 2 });
   console.log("\n🖼️  QRIS disimpan ke: qris-test.png  -> buka & scan untuk membayar.");
+
+  if (DO_SIM) {
+    console.log("\n🧪 Mode simulasi (Sandbox): mengirim paymentsimulation...");
+    const simRes = await pakasir.simulatePayment(orderId, raw.amount);
+    console.log("   Respons simulasi:", JSON.stringify(simRes));
+  }
 
   console.log("\n⏳ Polling status tiap 5 detik (maks 3 menit)...");
   const start = Date.now();

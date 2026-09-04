@@ -1691,6 +1691,13 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         if (workingMsg) await ctx.deleteMessage(workingMsg.message_id).catch(() => {});
         await ctx.reply('❌ Maaf, terjadi kesalahan internal saat membuat invoice. Silakan coba lagi nanti.');
 
+        // DEBUG: kirim penyebab asli ke OWNER agar mudah didiagnosa (tidak terlihat customer lain).
+        const ownerId = process.env.OWNER_ID;
+        if (ownerId) {
+            const detail = (error && error.message) ? error.message : String(error);
+            await bot.telegram.sendMessage(ownerId, `⚠️ [DEBUG PAKASIR] Gagal membuat invoice:\n${detail}`).catch(() => {});
+        }
+
     } finally {
         session.endSession();
     }

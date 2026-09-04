@@ -80,10 +80,12 @@ async function createTransaction(internalOrderId, amount) {
         status: error.response.status,
         data: error.response.data,
       });
-      throw new Error(
-        (error.response.data && (error.response.data.message || error.response.data.error)) ||
-          "Pakasir API Error"
-      );
+      const raw =
+        typeof error.response.data === "object"
+          ? JSON.stringify(error.response.data)
+          : String(error.response.data);
+      // Sertakan status + body mentah agar penyebab asli terlihat (bukan pesan generik).
+      throw new Error(`Pakasir API Error (HTTP ${error.response.status}): ${raw}`);
     }
     console.error("[PAKASIR CREATE ERROR]", error.message);
     throw error;

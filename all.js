@@ -21,6 +21,7 @@ const moment = require('moment-timezone');
 const { connectDB, User, Product, Order, Settings, slimPaymentDetails } = require('./db');
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
+const pakasir = require('./qris_pakasir');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
@@ -1530,8 +1531,8 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const orderDetails = { productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems };
         const customerInfo = { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name };
 
-        const rawPayment = await tokopay.createTransaction(internalOrderId, totalHarga);
-        console.log("[DOMPETX] Raw payment response:", JSON.stringify(rawPayment, null, 2));
+        const rawPayment = await pakasir.createTransaction(internalOrderId, totalHarga);
+        console.log("[PAKASIR] Raw payment response:", JSON.stringify(rawPayment, null, 2));
 
         const payment = {
             displayOrderId: rawPayment.displayOrderId,
@@ -1544,7 +1545,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             expiredAt: rawPayment.expiredAt,
         };
 
-        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response DompetX");
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response Pakasir");
 
         const newOrder = new Order({
             orderId: payment.displayOrderId,
@@ -1556,7 +1557,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             expiresAt: junkOrderExpiry(),
             ...orderDetails,
             customerInfo,
-            paymentGateway: "dompetx",
+            paymentGateway: "pakasir",
         });
         await newOrder.save({ session });
         await session.commitTransaction();
@@ -1572,7 +1573,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
 
         const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Total Dibayar: Rp ${payment.totalBayar.toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 3 Menit`;
-        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_dompetx_${payment.displayOrderId}`)]]);
+        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${payment.displayOrderId}`)]]);
 
         await ctx.deleteMessage().catch(() => {});
         qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
@@ -1611,10 +1612,10 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const pollingId = setInterval(async () => {
             if (isHandled) return;
             try {
-                const statusResult = await tokopay.checkPaymentStatus(payment.realOrderId);
-                console.log("[DOMPETX POLL] Status result:", JSON.stringify(statusResult, null, 2));
+                const statusResult = await pakasir.checkPaymentStatus(payment.realOrderId, payment.amount);
+                console.log("[PAKASIR POLL] Status result:", JSON.stringify(statusResult, null, 2));
 
-                const statusRaw = String(statusResult?.status || statusResult?.data?.status || "").toUpperCase();
+                const statusRaw = String(statusResult?.transaction?.status || statusResult?.status || statusResult?.data?.status || "").toUpperCase();
 
                 if (statusRaw === "PAID" || statusRaw === "SUCCESS" || statusRaw === "COMPLETED") {
                     isHandled = true;
@@ -1669,7 +1670,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
                 }
 
             } catch (pollError) {
-                console.error("[DOMPETX] Error saat polling:", pollError);
+                console.error("[PAKASIR] Error saat polling:", pollError);
                 isHandled = true;
                 stopPolling();
             }
@@ -1679,7 +1680,7 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         paymentSessions.set(payment.displayOrderId, { pollingId, timeoutId, qrPhotoMsgId: qrPhotoMsg.message_id });
 
     } catch (error) {
-        console.error('[DOMPETX] Error in action:', error);
+        console.error('[PAKASIR] Error in action:', error);
 
         if (!transactionCommitted) {
             await session.abortTransaction();
@@ -1782,6 +1783,52 @@ bot.action(/^cancel_payment_dana_(.*)$/, async (ctx) => {
 });
 
 // [KODE ASLI DIKEMBALIKAN] Handler terpisah untuk membatalkan pembayaran Linkqu (QRIS umum)
+// Handler pembatalan pembayaran Pakasir (QRIS ALL). Session & orderId di-key
+// berdasarkan displayOrderId. Didaftarkan SEBELUM handler generic di bawah agar
+// pola `cancel_payment_pakasir_...` tidak keliru ditangkap regex generic.
+bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const orderId = ctx.match[1];
+        const paymentSession = paymentSessions.get(orderId);
+        if (paymentSession) {
+            clearInterval(paymentSession.pollingId);
+            clearTimeout(paymentSession.timeoutId);
+            paymentSessions.delete(orderId);
+            await ctx.deleteMessage(paymentSession.qrPhotoMsgId).catch(() => {});
+        } else {
+            await ctx.deleteMessage().catch(() => {});
+        }
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            if (!order) {
+                await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
+                await session.abortTransaction();
+                session.endSession();
+                return;
+            }
+            if (order.reservedItems && order.reservedItems.length > 0) {
+                await Product.updateOne({ id: order.productId, "variants.slug": order.variantSlug }, { $push: { "variants.$.stock": { $each: order.reservedItems } }, $pull: { "variants.$.reserved_stock": { $in: order.reservedItems } } }).session(session);
+            }
+            await session.commitTransaction();
+            // Best-effort: batalkan juga di sisi Pakasir (tidak wajib berhasil).
+            pakasir.cancelTransaction(orderId, order.amount).catch(() => {});
+            await ctx.reply('❌ Pesanan QRIS Anda telah berhasil dibatalkan.');
+        } catch (dbError) {
+            await session.abortTransaction();
+            console.error('Database error during Pakasir cancellation:', dbError);
+            await ctx.reply('❌ Terjadi kesalahan internal saat membatalkan pesanan.');
+        } finally {
+            session.endSession();
+        }
+    } catch (error) {
+        console.error('Error in cancel_payment_pakasir:', error);
+        await ctx.reply('❌ Terjadi kesalahan saat memproses pembatalan.');
+    }
+});
+
 bot.action(/^cancel_payment_(.*)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -2065,14 +2112,14 @@ bot.hears(/^[^\/]/, async (ctx) => {
         } else if (userState.state === 'awaiting_broadcast_message') {
             const message = ctx.message.text;
             delete userStates[userId];
-            
+
             const statusMessage = await ctx.reply('Mengirim broadcast...');
             const allUsers = await User.find({}, 'id').lean();
             const userIds = allUsers.map(user => user.id);
-            
+
             let successCount = 0;
             let failCount = 0;
-            
+
             for (const id of userIds) {
                 try {
                     await ctx.telegram.sendMessage(id, message, { parse_mode: 'Markdown' });
@@ -2081,17 +2128,32 @@ bot.hears(/^[^\/]/, async (ctx) => {
                     failCount++;
                 }
             }
-            
-            await ctx.telegram.editMessageText(
-                ctx.chat.id, 
-                statusMessage.message_id, 
-                null, 
+
+            // Laporan hasil broadcast. Kegagalan meng-edit/mengirim laporan status
+            // (mis. Telegram menolak edit) TIDAK boleh dianggap broadcast gagal —
+            // dulu error di sini naik ke catch luar dan memunculkan notif
+            // "Terjadi kesalahan" walau pengiriman sebenarnya berhasil.
+            const summaryText =
                 `🚀 *Broadcast Selesai*\n\n` +
                 `✅ Berhasil terkirim: ${successCount} pengguna\n` +
-                `❌ Gagal terkirim: ${failCount} pengguna`, 
-                { parse_mode: 'Markdown' }
-            );
-            
+                `❌ Gagal terkirim: ${failCount} pengguna`;
+            try {
+                await ctx.telegram.editMessageText(
+                    ctx.chat.id,
+                    statusMessage.message_id,
+                    null,
+                    summaryText,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (editErr) {
+                console.error('Broadcast: gagal edit pesan status (diabaikan):', editErr.message);
+                // Fallback: kirim laporan sebagai pesan baru, tanpa Markdown agar aman.
+                await ctx.reply(
+                    `🚀 Broadcast Selesai\n\n✅ Berhasil terkirim: ${successCount} pengguna\n❌ Gagal terkirim: ${failCount} pengguna`
+                ).catch(() => {});
+            }
+            return;
+
         } else if (userState.state === 'awaiting_snk') {
             const newSnk = ctx.message.text;
             

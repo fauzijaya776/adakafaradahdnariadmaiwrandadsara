@@ -1737,6 +1737,30 @@ app.post(['/callback', '/qrin/callback'], async (req, res) => {
 
         if (!orderId) return res.status(400).json({ success: false, message: 'no_ref_merchant missing' });
 
+        // Referensi milik bot installer memakai prefiks "RDP-". Karena satu
+        // merchant QRIN hanya punya satu URL callback, callback deposit installer
+        // ikut masuk ke sini. Kita TERUSKAN apa adanya ke Render bot installer
+        // (token QRIN sama, jadi tanda tangannya tetap sah di sana).
+        if (String(orderId).startsWith('RDP-')) {
+            const target = process.env.QRIN_FORWARD_URL || 'https://cobacobasajaadnariadara-soac.onrender.com/callback';
+            try {
+                const fwd = await axios.post(target, rawBody, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Callback-Signature': signature || ''
+                    },
+                    timeout: 20000,
+                    transformRequest: [(d) => d] // kirim buffer mentah apa adanya
+                });
+                console.log(`[QRIN FORWARD] ${orderId} -> installer HTTP ${fwd.status}`);
+                return res.json({ success: true });
+            } catch (e) {
+                console.error('[QRIN FORWARD] gagal:', (e.response && e.response.status) || e.message);
+                // Balas non-200 supaya QRIN mengulang -> forward dicoba lagi nanti.
+                return res.status(502).json({ success: false, message: 'forward failed' });
+            }
+        }
+
         if (status === 'success') {
             const result = await fulfillQrinPaidOrder(orderId);
             if (!result.ok && result.reason === 'not_pending') {

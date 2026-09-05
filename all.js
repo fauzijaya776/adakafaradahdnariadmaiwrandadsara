@@ -1654,7 +1654,13 @@ async function fulfillQrinPaidOrder(orderId) {
         { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
         { new: true }
     );
-    if (!order) return { ok: false, reason: 'not_pending' };
+    if (!order) {
+        // Bedakan: callback duplikat (order sudah PAID -> abaikan diam-diam) vs
+        // pembayaran telat pada order yang sudah EXPIRED/CANCELLED (perlu cek manual).
+        const existing = await Order.findOne({ orderId: orderId }).lean();
+        if (existing && existing.status === 'PAID') return { ok: false, reason: 'already_paid' };
+        return { ok: false, reason: 'not_pending' };
+    }
 
     // Hentikan timeout kedaluwarsa & hapus pesan QR.
     const sess = paymentSessions.get(orderId);
@@ -1706,9 +1712,15 @@ async function fulfillQrinPaidOrder(orderId) {
 }
 
 // ===== Webhook / Callback QRIN =====
-// Daftarkan URL ini di Setting Merchant QRIN, mis: https://DOMAIN-ANDA/qrin/callback
+// Daftarkan salah satu URL ini di Setting Merchant QRIN:
+//   https://DOMAIN-ANDA/callback   ATAU   https://DOMAIN-ANDA/qrin/callback
+// (kedua path ditangani agar cocok dengan apa pun yang Anda isi di dashboard).
 // Tanda tangan: header X-Callback-Signature = HMAC-SHA256(raw body, QRIN_TOKEN).
-app.post('/qrin/callback', async (req, res) => {
+// Health check publik (tanpa login) untuk Render + keep-alive pinger
+// (mis. UptimeRobot ping tiap ~10 menit agar Render Free tidak tidur).
+app.get(['/health', '/ping'], (req, res) => res.status(200).send('OK'));
+
+app.post(['/callback', '/qrin/callback'], async (req, res) => {
     try {
         const signature = req.headers['x-callback-signature'];
         const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}), 'utf8');

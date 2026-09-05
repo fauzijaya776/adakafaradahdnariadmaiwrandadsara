@@ -1,0 +1,48 @@
+<% if (locals.success) { %>
+<div class="bg-green-100 border-l-4 border-green-500 text-green-700 px-4 py-3 rounded mb-6" role="alert">
+    <p><%= success %></p>
+</div>
+<% } %>
+
+<div class="bg-white rounded-lg shadow-md">
+    <div class="p-6 border-b flex items-center">
+        <svg class="w-6 h-6 mr-3 text-purple-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" /></svg>
+        <h2 class="text-xl font-semibold text-gray-800">Payment Gateway Management</h2>
+    </div>
+    <form action="/payment-gateways/save" method="POST" class="p-6">
+        <div class="space-y-5">
+            <p class="text-sm text-gray-600">Pilih metode pembayaran mana yang ingin Anda aktifkan di bot. Perubahan akan langsung terlihat oleh pengguna.</p>
+
+            <label for="linkqu_enabled" class="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50">
+                <input type="checkbox" id="linkqu_enabled" name="linkqu_enabled" class="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" <%= settings.linkqu_enabled ? 'checked' : '' %>>
+                <span class="ml-4 flex flex-col">
+                    <span class="font-semibold text-gray-800">QRIS (ALL)</span>
+                    <span class="text-xs text-gray-500">Pembayaran via Linkqu, mendukung semua e-wallet.</span>
+                </span>
+            </label>
+
+            <label for="dana_enabled" class="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50">
+                <input type="checkbox" id="dana_enabled" name="dana_enabled" class="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" <%= settings.dana_enabled ? 'checked' : '' %>>
+                <span class="ml-4 flex flex-col">
+                    <span class="font-semibold text-gray-800">DANA</span>
+                    <span class="text-xs text-gray-500">QRIS khusus untuk pembayaran via DANA.</span>
+                </span>
+            </label>
+
+            <label for="tokopay_enabled" class="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50">
+                <input type="checkbox" id="tokopay_enabled" name="tokopay_enabled" class="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" <%= settings.tokopay_enabled ? 'checked' : '' %>>
+                <span class="ml-4 flex flex-col">
+                    <span class="font-semibold text-gray-800">QRIS (Tokopay)</span>
+                    <span class="text-xs text-gray-500">Pembayaran via Tokopay.</span>
+                </span>
+            </label>
+        </div>
+
+        <div class="flex justify-end pt-6 border-t mt-6">
+            <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg shadow-md flex items-center">
+                 <svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" /></svg>
+                 Save Settings
+            </button>
+        </div>
+    </form>
+</div>

@@ -1,0 +1,87 @@
+<% if (locals.success) { %>
+<div class="bg-green-100 border-l-4 border-green-500 text-green-700 px-4 py-3 rounded mb-6" role="alert">
+    <p><%= success %></p>
+</div>
+<% } %>
+<% if (locals.error) { %>
+<div class="bg-red-100 border-l-4 border-red-500 text-red-700 px-4 py-3 rounded mb-6" role="alert">
+    <p><%= error %></p>
+</div>
+<% } %>
+
+<div class="bg-white rounded-lg shadow-md">
+    <div class="p-6 border-b flex items-center">
+        <svg class="w-6 h-6 mr-3 text-purple-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-2.236 9.168-5.584M13 18l5-5m0 0l-5-5m5 5H6" /></svg>
+        <h2 class="text-xl font-semibold text-gray-800">Broadcast Management</h2>
+    </div>
+    <form action="/broadcast/send" method="POST" enctype="multipart/form-data" class="p-6">
+        <div class="space-y-6">
+            <div>
+                <label for="broadcast_type" class="block text-sm font-medium text-gray-700 mb-1">Broadcast Type</label>
+                <select id="broadcast_type" name="broadcast_type" onchange="toggleImageOptions()" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+                    <option value="text_only">Text Message</option>
+                    <option value="image_with_text">Image with Text</option>
+                </select>
+            </div>
+
+            <div id="image_options" class="hidden">
+                <label class="block text-sm font-medium text-gray-700">Image Source</label>
+                <div class="mt-2 flex items-center space-x-4">
+                    <label class="inline-flex items-center">
+                        <input type="radio" class="form-radio text-indigo-600" name="image_source" value="url" checked onchange="toggleImageInput()">
+                        <span class="ml-2">URL</span>
+                    </label>
+                    <label class="inline-flex items-center">
+                        <input type="radio" class="form-radio text-indigo-600" name="image_source" value="upload" onchange="toggleImageInput()">
+                        <span class="ml-2">Upload</span>
+                    </label>
+                </div>
+            </div>
+
+            <div id="image_url_field" class="hidden">
+                <label for="image_url" class="block text-sm font-medium text-gray-700">Image URL</label>
+                <input type="url" name="image_url" id="image_url" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" placeholder="https://example.com/image.png">
+            </div>
+
+            <div id="image_file_field" class="hidden">
+                <label for="image_file" class="block text-sm font-medium text-gray-700">Image File</label>
+                <input type="file" name="image_file" id="image_file" class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
+            </div>
+
+            <div>
+                <label for="content" class="block text-sm font-medium text-gray-700 mb-1">Content</label>
+                <textarea id="content" name="content" rows="10" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm" placeholder="Enter your broadcast message here. Markdown is supported." required></textarea>
+            </div>
+        </div>
+
+        <div class="flex justify-end pt-6 border-t mt-6">
+            <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg shadow-md flex items-center">
+                 <svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                 Send Broadcast
+            </button>
+        </div>
+    </form>
+</div>
+<script>
+    function toggleImageOptions() {
+        const type = document.getElementById('broadcast_type').value;
+        const imageOptions = document.getElementById('image_options');
+        if (type === 'image_with_text') {
+            imageOptions.classList.remove('hidden');
+            toggleImageInput();
+        } else {
+            imageOptions.classList.add('hidden');
+            document.getElementById('image_url_field').classList.add('hidden');
+            document.getElementById('image_file_field').classList.add('hidden');
+        }
+    }
+
+    function toggleImageInput() {
+        const source = document.querySelector('input[name="image_source"]:checked').value;
+        document.getElementById('image_url_field').classList.toggle('hidden', source !== 'url');
+        document.getElementById('image_file_field').classList.toggle('hidden', source !== 'upload');
+    }
+
+    // Run on page load to set the initial state
+    document.addEventListener('DOMContentLoaded', toggleImageOptions);
+</script>

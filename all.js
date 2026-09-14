@@ -40,6 +40,11 @@ const GROUP_NOTIF_ID = process.env.GROUP_NOTIF_ID;
 const { userStates } = adminModule;
 const paymentSessions = new Map();
 
+// Nomor WhatsApp admin untuk Pesan Manual / Pre-Order (PO).
+// Bisa dioverride lewat .env (PO_WA_NUMBER); default sesuai kode.
+const PO_WA_NUMBER = (process.env.PO_WA_NUMBER || '6285173329868').replace(/\D/g, '');
+const PO_WA_URL = `https://wa.me/${PO_WA_NUMBER}?text=${encodeURIComponent('Halo admin, saya mau pesan manual (PO).')}`;
+
 // -----------------------------------------------------------------
 // FORMAT TAMPILAN AKUN UNTUK CUSTOMER
 // Khusus produk DigitalOcean: item disimpan sebagai
@@ -823,6 +828,7 @@ async function generateStartMessageAndKeyboard(ctx) {
             Markup.button.callback('📦 Cek Stok', 'show_stock'),
         ],
         [Markup.button.callback('🧾 Riwayat Transaksi', 'show_history')],
+        [Markup.button.url('📝 Pesan Manual (PO)', PO_WA_URL)],
     ];
     if (isAdmin) inlineRows.push([Markup.button.callback('⚙️ Admin Panel', 'open_admin')]);
 
@@ -882,6 +888,7 @@ async function generateProductListMessageAndKeyboard(page = 1) {
     const keyboard = Markup.inlineKeyboard([
         ...chunkedKeyboard,
         navButtons,
+        [Markup.button.url('📝 Pesan Manual (PO)', PO_WA_URL)],
         [Markup.button.callback('⬅️ Back to Home', 'back_to_start')]
     ]);
 

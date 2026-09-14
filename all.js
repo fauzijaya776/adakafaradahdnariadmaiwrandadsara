@@ -859,7 +859,10 @@ async function generateProductListMessageAndKeyboard(page = 1) {
     } else {
         products.forEach((p, index) => {
             const productNumber = (page - 1) * productsPerPage + index + 1;
-            message += `*[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())}\n`;
+            const variants = Array.isArray(p.variants) ? p.variants : [];
+            const totalStock = variants.reduce((sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
+            const stockEmoji = totalStock > 0 ? '✅' : '❌';
+            message += `${stockEmoji} *[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())} → x${totalStock}\n`;
             keyboardButtons.push(Markup.button.callback(`${productNumber}`, `show_product_${p.id}_page_${page}`));
         });
     }

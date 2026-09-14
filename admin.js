@@ -81,6 +81,7 @@ async function getAdminMenuMessageAndKeyboard() {
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('➕ Tambah Stok', 'admin_add_stock_select_product_1')],
     [Markup.button.callback('📤 Ambil Stok', 'ats_prod_1')],
+    [Markup.button.callback('👁️ Lihat Stok', 'vst_prod_1')],
     [Markup.button.callback('➕ Tambah Produk', 'admin_add_product')],
     [Markup.button.callback('✍️ Edit Produk', 'admin_edit_product_list_1')],
     [Markup.button.callback('💰 Harga Grosir', 'admin_bulk_select_product_1')],
@@ -653,6 +654,136 @@ async function handleTakeStockCount(ctx, userState) {
   return true;
 }
 
+/* ========================= LIHAT STOK (VIEW-ONLY, TIDAK DIAMBIL) ========================= */
+// Format satu baris akun agar lebih rapi (mirror formatAccountItem di all.js).
+function formatStockLineForView(item) {
+  if (!item || typeof item !== 'string') return String(item === null || item === undefined ? '' : item);
+  const allLines = item.split(/\r?\n/);
+  const firstLine = allLines[0];
+  const extra = allLines.slice(1).filter(l => l.trim());
+  if (firstLine.includes('dop_v1')) {
+    const parts = firstLine.split('|').map(p => p.trim());
+    const labels = ['api key', 'email', 'password', '2fa'];
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      out.push(`${labels[i] || `field${i + 1}`} = ${parts[i]}`);
+    }
+    if (extra.length) out.push(...extra);
+    return out.join('\n');
+  }
+  if (firstLine.includes('|')) {
+    const parts = firstLine.split('|').map(p => p.trim()).filter(Boolean);
+    const out = [...parts];
+    if (extra.length) out.push(...extra);
+    return out.join('\n');
+  }
+  return item;
+}
+
+async function getViewStockProductList(page = 1) {
+  const products = await Product.find({}).sort({ name: 1 }).lean();
+  const perPage = 5;
+  const startIndex = (page - 1) * perPage;
+  const paginated = products.slice(startIndex, startIndex + perPage);
+
+  let message = '👁️ *Lihat Stok*\n\nPilih produk untuk melihat isi stoknya (stok TIDAK diambil/dihapus):\n\n';
+  const numberButtons = [];
+
+  if (paginated.length === 0) {
+    message += '_Belum ada produk._';
+  } else {
+    paginated.forEach((p, index) => {
+      const productNumber = startIndex + index + 1;
+      const totalStock = (p.variants || []).reduce(
+        (sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
+      message += `*${productNumber}. ${esc(p.name)}* — total ${totalStock}\n`;
+      numberButtons.push(Markup.button.callback(String(productNumber), `vst_var_${p.id}_1`));
+    });
+  }
+
+  const navigationButtons = [];
+  if (page > 1) navigationButtons.push(Markup.button.callback('⬅️', `vst_prod_${page - 1}`));
+  if (startIndex + perPage < products.length) navigationButtons.push(Markup.button.callback('➡️', `vst_prod_${page + 1}`));
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([
+      numberButtons,
+      navigationButtons,
+      [Markup.button.callback('⬅️ Batal', 'admin_menu')]
+    ])
+  };
+}
+
+async function getViewStockVariantList(productId, page = 1) {
+  const product = await Product.findOne({ id: productId }).lean();
+  if (!product) {
+    return {
+      message: '❌ Produk tidak ditemukan.',
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'vst_prod_1')]])
+    };
+  }
+
+  const perPage = 5;
+  const startIndex = (page - 1) * perPage;
+  const variants = product.variants || [];
+  const paginated = variants.slice(startIndex, startIndex + perPage);
+
+  const message = `👁️ *Lihat Stok: ${esc(product.name)}*\n\nPilih varian untuk menampilkan isi stoknya:`;
+  const variantButtons = paginated.map(v => {
+    const stockCount = Array.isArray(v.stock) ? v.stock.length : 0;
+    return [Markup.button.callback(`${v.name} (Stok: ${stockCount})`, `vst_show:${product.id}:${v.slug}`)];
+  });
+
+  const navigationButtons = [];
+  if (page > 1) navigationButtons.push(Markup.button.callback('⬅️', `vst_var_${productId}_${page - 1}`));
+  if (startIndex + perPage < variants.length) navigationButtons.push(Markup.button.callback('➡️', `vst_var_${productId}_${page + 1}`));
+
+  return {
+    message,
+    keyboard: Markup.inlineKeyboard([
+      ...variantButtons,
+      navigationButtons,
+      [Markup.button.callback('⬅️ Kembali ke Produk', 'vst_prod_1')]
+    ])
+  };
+}
+
+/** Tampilkan isi stok sebuah varian ke admin TANPA mengambil/menghapus apa pun. */
+async function viewStock(productId, variantSlug, ctx) {
+  try {
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) return ctx.reply('❌ Produk tidak ditemukan.');
+    const variant = (product.variants || []).find(v => v.slug === variantSlug);
+    if (!variant) return ctx.reply('❌ Varian tidak ditemukan.');
+
+    const stock = Array.isArray(variant.stock) ? variant.stock : [];
+    const total = stock.length;
+    const header = `👁️ *Isi Stok (view-only, tidak diambil)*\n` +
+      `*Produk:* ${esc(product.name)}\n*Varian:* ${esc(variant.name)}\n*Total stok:* ${total}\n`;
+
+    if (total === 0) {
+      return ctx.reply(header + '\n_Stok kosong._', { parse_mode: 'Markdown' });
+    }
+
+    if (total <= 20) {
+      const list = stock.map((it, i) => `${i + 1}.\n${formatStockLineForView(it)}`).join('\n\n');
+      await ctx.reply(header + '\n```\n' + list + '\n```', { parse_mode: 'Markdown' });
+    } else {
+      await ctx.reply(header, { parse_mode: 'Markdown' });
+      const fileContent = stock.map((it, i) => `${i + 1}.\n${formatStockLineForView(it)}`).join('\n\n');
+      await ctx.replyWithDocument({
+        source: Buffer.from(fileContent, 'utf-8'),
+        filename: `stok_${variantSlug}_${Date.now()}.txt`
+      });
+    }
+  } catch (error) {
+    console.error('viewStock error:', error);
+    await ctx.reply('❌ Terjadi kesalahan saat menampilkan stok.');
+  }
+}
+
 module.exports = (bot) => {
   bot.command('admin', adminMiddleware, async (ctx) => {
     const {
@@ -1070,6 +1201,42 @@ bot.action('confirm_transfer_no', adminMiddleware, async (ctx) => {
     } catch (error) {
       console.error('Error ats_qty:', error);
       await ctx.reply('❌ Gagal memuat pilihan jumlah.');
+    }
+  });
+
+  // ---------------- LIHAT STOK (view-only, admin Telegram saja) ----------------
+  bot.command('lihatstok', adminMiddleware, async (ctx) => {
+    const { message, keyboard } = await getViewStockProductList(1);
+    await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+  });
+
+  bot.action(/^vst_prod_(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await editScreen(ctx, await getViewStockProductList(parseInt(ctx.match[1], 10)));
+    } catch (error) {
+      console.error('Error vst_prod:', error);
+      await ctx.reply('❌ Gagal memuat daftar produk.');
+    }
+  });
+
+  bot.action(/^vst_var_(.+?)_(\d+)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await editScreen(ctx, await getViewStockVariantList(ctx.match[1], parseInt(ctx.match[2], 10)));
+    } catch (error) {
+      console.error('Error vst_var:', error);
+      await ctx.reply('❌ Gagal memuat daftar varian.');
+    }
+  });
+
+  bot.action(/^vst_show:(.+?):(.*)$/, adminMiddleware, async (ctx) => {
+    try {
+      await ctx.answerCbQuery();
+      await viewStock(ctx.match[1], ctx.match[2], ctx);
+    } catch (error) {
+      console.error('Error vst_show:', error);
+      await ctx.reply('❌ Gagal menampilkan stok.');
     }
   });
 

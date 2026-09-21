@@ -249,6 +249,41 @@ async function markOrderDelivered(orderId) {
     }
 }
 
+// Notifikasi ke OWNER tiap ada order yang berhasil dibayar:
+// berisi User ID pembeli, produk, jumlah, dan harga. Dikirim ke DM owner
+// (OWNER_ID), terpisah dari notifikasi grup (GROUP_NOTIF_ID).
+async function notifyOwnerNewOrder(order) {
+    const owners = ownerIdList();
+    if (owners.length === 0) return;
+
+    let waktu;
+    try {
+        waktu = moment(order.paidAt || new Date()).tz('Asia/Jakarta').format('HH:mm DD/MM/YY');
+    } catch (e) {
+        waktu = new Date().toISOString();
+    }
+
+    const nama = order.customerInfo?.first_name ? ` (${order.customerInfo.first_name})` : '';
+    const msg = [
+        '🛒 *Order Baru — Sudah Dibayar*',
+        `👤 User ID: \`${order.customerInfo?.telegramUserId || '-'}\`${nama}`,
+        `📦 Produk: ${order.productName || '-'}${order.variantName ? ' - ' + order.variantName : ''}`,
+        `🔢 Jumlah: ${order.quantity || 1}x`,
+        `💰 Harga: Rp ${Number(order.amount || 0).toLocaleString('id-ID')}`,
+        `💳 Metode: ${(order.paymentGateway || '-').toUpperCase()}`,
+        `🧾 Order ID: \`${order.orderId}\``,
+        `🕒 ${waktu}`,
+    ].join('\n');
+
+    for (const ownerId of owners) {
+        try {
+            await bot.telegram.sendMessage(ownerId, msg, { parse_mode: 'Markdown' });
+        } catch (e) {
+            console.error(`[ORDER-NOTIF] gagal kirim ke owner ${ownerId}:`, e.message);
+        }
+    }
+}
+
 async function alertOwnerDeliveryFailed(order, reason) {
     const owners = ownerIdList();
     if (owners.length === 0) return;
@@ -327,8 +362,11 @@ async function deliverAccountsToCustomer(order, methodLabel) {
             );
         }
 
+        const wasFirstDelivery = !order.delivered;
         await markOrderDelivered(order.orderId);
         if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
+        // Notif owner hanya saat pengiriman PERTAMA (bukan saat /resend).
+        if (wasFirstDelivery) await notifyOwnerNewOrder(order).catch(() => {});
         return true;
     } catch (err) {
         console.error(`[DELIVERY] GAGAL kirim akun order ${order.orderId}:`, err.message);
@@ -704,6 +742,40 @@ app.get('/api-docs', authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("API Docs Page Error:", error);
         res.status(500).send("Error loading API documentation.");
+    }
+});
+
+// --- Status DO (admin panel): halaman + aksi jalankan pengecekan seketika ---
+app.get('/statusdo', authMiddleware, async (req, res) => {
+    try {
+        res.render('layout', {
+            page: 'statusdo',
+            body: await ejs.renderFile(path.join(__dirname, 'views/statusdo.ejs'), { locals: {} })
+        });
+    } catch (error) {
+        console.error("Status DO Page Error:", error);
+        res.status(500).send("Error loading Status DO page.");
+    }
+});
+
+// Dipanggil lewat fetch() dari halaman Status DO. Menjalankan docheck lalu balas JSON.
+// Catatan: akun berstatus LOCKED tetap dihapus dari stok (sama seperti /statusdo di bot).
+app.post('/statusdo/run', authMiddleware, async (req, res) => {
+    try {
+        const r = await docheck.runDigitalOceanCheck(bot);
+        if (r && r.skipped) return res.json({ ok: false, skipped: true });
+        if (r && typeof r.error === 'string') return res.json({ ok: false, message: r.error });
+        return res.json({
+            ok: true,
+            checked: r.checked || 0,
+            active: r.active || 0,
+            locked: r.locked || 0,
+            invalid: r.invalid || 0,
+            errorCount: r.errorCount || 0,
+        });
+    } catch (error) {
+        console.error("Status DO Run Error:", error);
+        return res.status(500).json({ ok: false, message: error.message });
     }
 });
 // =================================================================
@@ -1950,10 +2022,10 @@ async function fulfillQrinPaidOrder(orderId) {
 }
 
 // =================================================================
-// PAKASIR (QRIS ALL) — pengganti QRIN.
-// Konfirmasi pembayaran memakai POLLING ke endpoint transactiondetail
-// (Pakasir menyediakan cek status), jadi TIDAK perlu domain/callback.
-// Webhook Pakasir tetap didukung sebagai cadangan (lihat route /callback).
+// PAKASIR API v2 (QRIS ALL) — pengganti QRIN.
+// Konfirmasi pembayaran memakai POLLING ke endpoint /api/v2/transaction-status
+// (pakai txn_id), jadi TIDAK wajib domain/callback.
+// Webhook Pakasir v2 (header X-Secret) tetap didukung sebagai cadangan (route /callback).
 // =================================================================
 bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     let workingMsg, qrPhotoMsg;
@@ -1997,9 +2069,10 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const payment = {
             displayOrderId: rawPayment.displayOrderId,   // = internalOrderId
             realOrderId: rawPayment.realOrderId,
+            txnId: rawPayment.txnId,                     // v2: WAJIB utk cek status
             qrString: rawPayment.qrString,
-            amount: rawPayment.amount,                   // nominal dasar (dikirim ke Pakasir)
-            totalBayar: rawPayment.totalBayar,           // yang dibayar customer
+            amount: rawPayment.amount,                   // nominal dasar (diterima merchant)
+            totalBayar: rawPayment.totalBayar,           // yang dibayar customer (sudah + fee)
             fee: rawPayment.fee,
         };
 
@@ -2008,9 +2081,10 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         const newOrder = new Order({
             orderId: payment.displayOrderId,
             realOrderId: payment.realOrderId,
+            pakasirTxnId: payment.txnId,  // v2: dipakai cek status & rekonsiliasi
             internalRefId: internalOrderId,
             depositId: payment.realOrderId,
-            amount: totalHarga,           // nominal dasar -> dipakai polling & statistik
+            amount: totalHarga,           // nominal dasar (diterima merchant) -> statistik
             status: "PENDING",
             expiresAt: junkOrderExpiry(),
             ...orderDetails,
@@ -2027,7 +2101,7 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
         });
         const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
 
-        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${product.name.toUpperCase()} - ${variant.name}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Kedaluwarsa dalam: 5 Menit`;
         const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_pakasir_${payment.displayOrderId}`)]]);
 
         await ctx.deleteMessage().catch(() => {});
@@ -2069,8 +2143,8 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             if (isHandled) return;
             if (Date.now() - startedAt > pollDuration) { await handleExpiry(); return; }
             try {
-                const res = await pakasir.checkPaymentStatus(payment.displayOrderId, totalHarga);
-                const status = String(res?.transaction?.status || '').toLowerCase();
+                const res = await pakasir.checkPaymentStatus(payment.txnId);
+                const status = String(res?.status || '').toLowerCase();
                 if (status === 'completed') {
                     if (isHandled) return;
                     isHandled = true;
@@ -2170,8 +2244,8 @@ async function reconcilePakasirPendingOrders() {
         let fulfilled = 0;
         for (const o of pendings) {
             try {
-                const res = await pakasir.checkPaymentStatus(o.orderId, o.amount);
-                const status = String(res?.transaction?.status || '').toLowerCase();
+                const res = await pakasir.checkPaymentStatus(o.pakasirTxnId);
+                const status = String(res?.status || '').toLowerCase();
                 if (status === 'completed') {
                     const r = await fulfillPakasirPaidOrder(o.orderId);
                     if (r && r.ok) {
@@ -2246,39 +2320,48 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
 app.get(['/health', '/ping'], (req, res) => res.status(200).send('OK'));
 
 // Menangani DUA gateway pada satu route:
-//  - PAKASIR : POST tanpa signature, body { order_id, status:"completed", amount, ... }
-//              -> ini yang dipakai sekarang. URL webhook di dashboard Pakasir:
-//                 https://fzistore.my.id/callback  (atau /pakasir/callback).
-//              CATATAN: webhook Pakasir OPSIONAL — bot sudah polling status sendiri,
-//              jadi pembayaran tetap terkonfirmasi walau webhook tidak diset.
-//  - QRIN    : POST dengan header X-Callback-Signature, body { no_ref_merchant, status:"success" }
-//              (dipertahankan agar kompatibel; sudah tidak dipakai lagi).
+//  - PAKASIR v2 : POST dengan header X-Secret, body { txn_id, order_id, status:"completed", amount, ... }
+//                 URL webhook di dashboard Pakasir: https://fzistore.my.id/callback (atau /pakasir/callback).
+//                 CATATAN: webhook Pakasir OPSIONAL — bot juga polling status sendiri,
+//                 jadi pembayaran tetap terkonfirmasi walau webhook tidak diset.
+//  - QRIN       : POST dengan header X-Callback-Signature, body { no_ref_merchant, status:"success" }
+//                 (dipertahankan agar kompatibel; sudah tidak dipakai lagi).
 app.post(['/callback', '/qrin/callback', '/pakasir/callback'], async (req, res) => {
     try {
         const body = req.body || {};
         const signature = req.headers['x-callback-signature'];
-        // Pakasir tidak mengirim signature dan memakai field order_id (bukan no_ref_merchant).
+        // Pakasir v2: ada header X-Secret & field txn_id/order_id (bukan no_ref_merchant/HMAC).
         const isPakasir = req.path.includes('pakasir')
-            || (!signature && !body.no_ref_merchant && (body.order_id || body.status));
+            || req.headers['x-secret'] !== undefined
+            || (!signature && !body.no_ref_merchant && (body.txn_id || body.order_id || body.status));
 
-        // ---------------- PAKASIR (tanpa tanda tangan) ----------------
+        // ---------------- PAKASIR v2 (verifikasi header X-Secret) ----------------
         if (isPakasir) {
+            // v2: Pakasir mengirim header X-Secret. Tolak bila tidak cocok.
+            const secretHeader = req.headers['x-secret'];
+            if (!pakasir.verifyWebhookSecret(secretHeader)) {
+                console.warn('[PAKASIR CALLBACK] X-Secret tidak valid — ditolak.');
+                return res.status(401).json({ success: false, message: 'Invalid secret' });
+            }
+
             const orderId = body.order_id;
+            const txnId = body.txn_id;
             const status = String(body.status || '').toLowerCase();
-            console.log(`[PAKASIR CALLBACK] order=${orderId} status=${status}`);
+            console.log(`[PAKASIR CALLBACK] order=${orderId} txn=${txnId} status=${status}`);
             if (!orderId) return res.status(400).json({ success: false, message: 'order_id missing' });
 
             if (status === 'completed') {
-                // Karena Pakasir tidak pakai signature, verifikasi ulang status ke
-                // endpoint transactiondetail (sesuai anjuran dokumentasi) sebelum
-                // memenuhi order — mencegah callback palsu.
+                // X-Secret sudah lolos; verifikasi ulang status ke Pakasir (pakai txn_id)
+                // sebagai lapis kedua bila txn_id tersedia.
                 let verified = true;
-                try {
-                    const detail = await pakasir.checkPaymentStatus(orderId, body.amount);
-                    verified = String(detail?.transaction?.status || '').toLowerCase() === 'completed';
-                } catch (e) {
-                    console.error('[PAKASIR CALLBACK] verify error:', e.message);
-                    verified = false;
+                if (txnId) {
+                    try {
+                        const detail = await pakasir.checkPaymentStatus(txnId);
+                        verified = String(detail?.status || '').toLowerCase() === 'completed';
+                    } catch (e) {
+                        console.error('[PAKASIR CALLBACK] verify error:', e.message);
+                        verified = false;
+                    }
                 }
 
                 if (verified) {
@@ -3244,6 +3327,39 @@ bot.command('cekdo', async (ctx) => {
         }
     } catch (err) {
         await ctx.reply(`❌ Gagal: ${err.message}`);
+    }
+});
+
+// /statusdo — jalankan pengecekan DigitalOcean SEKETIKA + ringkasan
+// aktif/locked/invalid/error (khusus owner). Locked tetap dihapus dari stok.
+bot.command('statusdo', async (ctx) => {
+    const ADMIN_IDS = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+    if (!ADMIN_IDS.includes(String(ctx.from.id))) return; // abaikan bila bukan owner
+
+    await ctx.reply('🔍 Menjalankan pengecekan status DigitalOcean sekarang... (ringkasan dikirim setelah selesai)');
+    try {
+        const r = await docheck.runDigitalOceanCheck(bot);
+        if (r && r.skipped) {
+            return ctx.reply('⏳ Pengecekan lain sedang berjalan. Coba lagi sebentar.');
+        }
+        if (r && typeof r.error === 'string') {
+            return ctx.reply(`❌ Gagal: ${r.error}`);
+        }
+        if (r && typeof r.checked === 'number') {
+            const msg = [
+                '📊 *Status DigitalOcean — Selesai*',
+                '',
+                `🔢 Total dicek: *${r.checked}*`,
+                `✅ Aktif: *${r.active}*`,
+                `🔒 Locked (dihapus): *${r.locked}*`,
+                `⚠️ Invalid: *${r.invalid}*`,
+                `🌐 Error/skip: *${r.errorCount}*`,
+            ].join('\n');
+            return ctx.reply(msg, { parse_mode: 'Markdown' });
+        }
+        return ctx.reply('✅ Pengecekan selesai.');
+    } catch (err) {
+        return ctx.reply(`❌ Gagal: ${err.message}`);
     }
 });
 

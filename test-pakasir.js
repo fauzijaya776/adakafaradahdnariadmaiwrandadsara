@@ -36,8 +36,9 @@ const DO_SIM = (process.argv[3] || "").toLowerCase() === "sim";
   console.log("✅ Transaksi dibuat. Respons terparse:");
   console.log(JSON.stringify(raw, null, 2));
   console.log("\n- order_id     :", orderId);
+  console.log("- txn_id       :", raw.txnId);
   console.log("- Base (diterima):", raw.amount);
-  console.log("- Fee          :", raw.fee);
+  console.log("- Fee (customer):", raw.fee);
   console.log("- Total bayar  :", raw.totalBayar);
 
   if (!raw.qrString) {
@@ -49,9 +50,7 @@ const DO_SIM = (process.argv[3] || "").toLowerCase() === "sim";
   console.log("\n🖼️  QRIS disimpan ke: qris-test.png  -> buka & scan untuk membayar.");
 
   if (DO_SIM) {
-    console.log("\n🧪 Mode simulasi (Sandbox): mengirim paymentsimulation...");
-    const simRes = await pakasir.simulatePayment(orderId, raw.amount);
-    console.log("   Respons simulasi:", JSON.stringify(simRes));
+    console.log("\n🧪 Mode simulasi: API v2 tidak menyediakan endpoint simulasi — gunakan Sandbox/dashboard Pakasir.");
   }
 
   console.log("\n⏳ Polling status tiap 5 detik (maks 3 menit)...");
@@ -62,10 +61,8 @@ const DO_SIM = (process.argv[3] || "").toLowerCase() === "sim";
       console.log("\n⌛ Timeout 3 menit. Belum terbayar / tidak terdeteksi.");
       process.exit(0);
     }
-    const res = await pakasir.checkPaymentStatus(orderId, raw.amount);
-    const status = String(
-      res?.transaction?.status || res?.status || res?.data?.status || "?"
-    ).toUpperCase();
+    const res = await pakasir.checkPaymentStatus(raw.txnId);
+    const status = String(res?.status || "?").toUpperCase();
     process.stdout.write(`  status: ${status}\n`);
     if (["PAID", "SUCCESS", "COMPLETED"].includes(status)) {
       clearInterval(timer);

@@ -1,0 +1,102 @@
+<div class="max-w-3xl">
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h2 class="text-lg font-bold text-gray-800 mb-1">Status DigitalOcean</h2>
+        <p class="text-sm text-gray-500 mb-4">
+            Menjalankan pengecekan seluruh akun DigitalOcean di stok secara langsung (tanpa menunggu jadwal).
+            Akun berstatus <span class="font-semibold text-red-600">locked</span> otomatis dihapus dari stok,
+            token <span class="font-semibold text-amber-600">invalid</span> hanya dilaporkan untuk dicek manual.
+        </p>
+        <button id="runBtn"
+            class="inline-flex items-center gap-2 bg-purple-700 hover:bg-purple-800 text-white font-semibold py-2.5 px-5 rounded-lg text-sm disabled:opacity-60 disabled:cursor-not-allowed">
+            <svg id="spin" class="w-4 h-4 animate-spin hidden" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+            </svg>
+            <span id="btnText">Jalankan Pengecekan Sekarang</span>
+        </button>
+        <p id="hint" class="text-xs text-gray-400 mt-3">
+            Proses bisa memakan waktu bila stok banyak (ada jeda antar-akun untuk menghindari rate-limit). Mohon tunggu sampai selesai.
+        </p>
+    </div>
+
+    <div id="resultCard" class="bg-white rounded-xl shadow p-6 hidden">
+        <h3 class="text-sm font-semibold text-gray-700 mb-4">Ringkasan Terakhir</h3>
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-4">
+            <div class="rounded-lg border border-gray-100 p-4 text-center">
+                <div id="cTotal" class="text-2xl font-bold text-gray-800">0</div>
+                <div class="text-xs text-gray-500 mt-1">Total Dicek</div>
+            </div>
+            <div class="rounded-lg border border-green-100 bg-green-50 p-4 text-center">
+                <div id="cActive" class="text-2xl font-bold text-green-700">0</div>
+                <div class="text-xs text-green-700 mt-1">Aktif</div>
+            </div>
+            <div class="rounded-lg border border-red-100 bg-red-50 p-4 text-center">
+                <div id="cLocked" class="text-2xl font-bold text-red-700">0</div>
+                <div class="text-xs text-red-700 mt-1">Locked (dihapus)</div>
+            </div>
+            <div class="rounded-lg border border-amber-100 bg-amber-50 p-4 text-center">
+                <div id="cInvalid" class="text-2xl font-bold text-amber-700">0</div>
+                <div class="text-xs text-amber-700 mt-1">Invalid</div>
+            </div>
+            <div class="rounded-lg border border-gray-100 p-4 text-center">
+                <div id="cError" class="text-2xl font-bold text-gray-500">0</div>
+                <div class="text-xs text-gray-500 mt-1">Error/Skip</div>
+            </div>
+        </div>
+        <p id="resultTime" class="text-xs text-gray-400 mt-4"></p>
+    </div>
+
+    <div id="msgBox" class="hidden mt-4 text-sm rounded-lg px-4 py-3"></div>
+</div>
+
+<script>
+(function () {
+    var btn = document.getElementById('runBtn');
+    var spin = document.getElementById('spin');
+    var btnText = document.getElementById('btnText');
+    var resultCard = document.getElementById('resultCard');
+    var msgBox = document.getElementById('msgBox');
+
+    function showMsg(text, kind) {
+        msgBox.textContent = text;
+        msgBox.className = 'mt-4 text-sm rounded-lg px-4 py-3 ' +
+            (kind === 'error' ? 'bg-red-50 text-red-700 border border-red-100'
+                              : 'bg-blue-50 text-blue-700 border border-blue-100');
+        msgBox.classList.remove('hidden');
+    }
+
+    btn.addEventListener('click', async function () {
+        btn.disabled = true;
+        spin.classList.remove('hidden');
+        btnText.textContent = 'Sedang mengecek...';
+        msgBox.classList.add('hidden');
+
+        try {
+            var res = await fetch('/statusdo/run', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+            var data = await res.json();
+
+            if (!data.ok) {
+                if (data.skipped) {
+                    showMsg('Pengecekan lain sedang berjalan. Coba lagi sebentar.', 'error');
+                } else {
+                    showMsg('Gagal: ' + (data.message || 'terjadi kesalahan'), 'error');
+                }
+            } else {
+                document.getElementById('cTotal').textContent = data.checked;
+                document.getElementById('cActive').textContent = data.active;
+                document.getElementById('cLocked').textContent = data.locked;
+                document.getElementById('cInvalid').textContent = data.invalid;
+                document.getElementById('cError').textContent = data.errorCount;
+                document.getElementById('resultTime').textContent = 'Selesai pada ' + new Date().toLocaleString('id-ID');
+                resultCard.classList.remove('hidden');
+            }
+        } catch (e) {
+            showMsg('Gagal menghubungi server: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
+            spin.classList.add('hidden');
+            btnText.textContent = 'Jalankan Pengecekan Sekarang';
+        }
+    });
+})();
+</script>

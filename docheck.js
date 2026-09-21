@@ -144,6 +144,8 @@ async function runDigitalOceanCheck(bot) {
     const removed = [];   // akun locked yang dihapus
     const invalid = [];   // token invalid (lapor manual)
     let checked = 0;
+    let activeCount = 0;  // akun sehat (active/warning)
+    let errorCount = 0;   // gagal cek sementara (rate-limit/jaringan/status lain)
 
     try {
         const products = await Product.find().lean();
@@ -182,8 +184,11 @@ async function runDigitalOceanCheck(bot) {
                             variant: variant.name,
                             token,
                         });
+                    } else if (status === 'active') {
+                        activeCount += 1; // akun sehat -> biarkan
+                    } else {
+                        errorCount += 1;  // 'error'/status lain -> coba lagi siklus berikutnya
                     }
-                    // 'active' -> biarkan; 'error' -> coba lagi siklus berikutnya
                 }
             }
         }
@@ -226,8 +231,15 @@ async function runDigitalOceanCheck(bot) {
             await notifyOwners(bot, lines.join('\n'));
         }
 
-        console.log(`[DO-CHECK] Selesai. Dicek: ${checked}, locked-dihapus: ${removed.length}, invalid: ${invalid.length}.`);
-        return { checked, removed: removed.length, invalid: invalid.length };
+        console.log(`[DO-CHECK] Selesai. Dicek: ${checked}, aktif: ${activeCount}, locked-dihapus: ${removed.length}, invalid: ${invalid.length}, error: ${errorCount}.`);
+        return {
+            checked,
+            active: activeCount,
+            locked: removed.length,
+            removed: removed.length, // alias lama (dipakai /cekdo)
+            invalid: invalid.length,
+            errorCount, // gagal cek sementara (JANGAN pakai key 'error' — itu penanda exception)
+        };
     } catch (error) {
         console.error('[DO-CHECK] Error:', error.message);
         return { error: error.message };

@@ -2,9 +2,11 @@ const {
   Markup
 } = require('telegraf');
 const {
-  Product
+  Product,
+  AlimSale
 } = require('./db');
 const mongoose = require('mongoose');
+const moment = require('moment-timezone');
 const {
   createTransfer,
   getProfile
@@ -90,6 +92,7 @@ async function getAdminMenuMessageAndKeyboard() {
     [Markup.button.callback('🚀 Broadcast', 'admin_broadcast')],
     [Markup.button.callback('💳 Buat Transfer', 'admin_tf')],
     [Markup.button.callback('🧾 Cek Saldo', 'admin_profile')],
+    [Markup.button.callback('💵 Dana Alim', 'admin_dana_alim')],
     [Markup.button.callback('⬅️ Kembali ke Menu Utama', 'back_to_start')]
   ]);
 
@@ -97,6 +100,63 @@ async function getAdminMenuMessageAndKeyboard() {
     message,
     keyboard
   };
+}
+
+// ================= DANA ALIM (catatan dana order tokotelealim) =================
+// Total order ALIM- yang masuk ke akun Pakasir bersama dan belum dibayarkan ke
+// pemilik tokotelealim. Hanya CATATAN — tidak memengaruhi saldo Pakasir.
+const rpFmt = (n) => 'Rp ' + Number(n || 0).toLocaleString('id-ID');
+const wibFmt = (d) => (d ? moment(d).tz('Asia/Jakarta').format('DD/MM HH:mm') : '-');
+
+async function buildDanaAlimView(notice) {
+  const [agg] = await AlimSale.aggregate([
+    { $match: { settled: false } },
+    { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 }, latest: { $max: '$createdAt' } } },
+  ]);
+  const total = agg ? agg.total : 0;
+  const count = agg ? agg.count : 0;
+  const latestMs = agg && agg.latest ? new Date(agg.latest).getTime() : 0;
+
+  const recent = await AlimSale.find({ settled: false }).sort({ createdAt: -1 }).limit(10).lean();
+  const [last] = await AlimSale.aggregate([
+    { $match: { settled: true, settledAt: { $ne: null } } },
+    { $group: { _id: '$settledAt', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+    { $sort: { _id: -1 } },
+    { $limit: 1 },
+  ]);
+
+  let text = notice ? `${notice}\n\n` : '';
+  text += '💵 *Dana tokotelealim (Alim Store)*\n\n' +
+    `Belum dibayarkan: *${rpFmt(total)}*\n` +
+    `Jumlah order: *${count}*\n`;
+  if (recent.length > 0) {
+    text += `\n*${count > recent.length ? `10 order terbaru dari ${count}` : 'Daftar order'}:*\n`;
+    recent.forEach((r) => {
+      text += `• ${wibFmt(r.completedAt || r.createdAt)} — ${rpFmt(r.amount)}\n   \`${r.orderId}\`\n`;
+    });
+  } else {
+    text += '\nBelum ada catatan.\n';
+  }
+  if (last) text += `\nReset terakhir: ${wibFmt(last._id)} — ${rpFmt(last.total)} (${last.count} order)`;
+  text += '\n\n_Hanya catatan, tidak memengaruhi saldo Pakasir._';
+
+  const rows = [];
+  // latestMs ikut di tombol: yang di-reset hanya order yang TAMPIL di layar ini.
+  if (count > 0) rows.push([Markup.button.callback('🔄 Reset ke 0 (sudah dibayar)', `dar_ask:${latestMs}`)]);
+  rows.push([Markup.button.callback('♻️ Muat ulang', 'admin_dana_alim')]);
+  rows.push([Markup.button.callback('⬅️ Kembali', 'admin_menu')]);
+  return { text, keyboard: Markup.inlineKeyboard(rows) };
+}
+
+// editMessageText gagal bila isi sama persis ("message is not modified") -> abaikan.
+async function safeEditOrReply(ctx, text, keyboard) {
+  const opts = { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup };
+  try {
+    await ctx.editMessageText(text, opts);
+  } catch (e) {
+    const msg = String((e && (e.description || e.message)) || '');
+    if (!msg.includes('message is not modified')) await ctx.reply(text, opts);
+  }
 }
 
 async function getProductManagementList(action, page = 1) {
@@ -842,6 +902,75 @@ module.exports = (bot) => {
     } catch (err) {
       console.error(err);
       ctx.reply('❌ Gagal memuat profil');
+    }
+  });
+
+  // ---------- Dana Alim ----------
+  bot.command('danaalim', adminMiddleware, async (ctx) => {
+    try {
+      const { text, keyboard } = await buildDanaAlimView();
+      await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+    } catch (err) {
+      console.error('[DANA ALIM] view error:', err);
+      ctx.reply('❌ Gagal memuat Dana Alim.');
+    }
+  });
+
+  bot.action('admin_dana_alim', adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    try {
+      const { text, keyboard } = await buildDanaAlimView();
+      await safeEditOrReply(ctx, text, keyboard);
+    } catch (err) {
+      console.error('[DANA ALIM] view error:', err);
+      ctx.reply('❌ Gagal memuat Dana Alim.');
+    }
+  });
+
+  // Langkah konfirmasi sebelum reset.
+  bot.action(/^dar_ask:(\d+)$/, adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    try {
+      const uptoMs = Number(ctx.match[1]);
+      const [agg] = await AlimSale.aggregate([
+        { $match: { settled: false, createdAt: { $lte: new Date(uptoMs) } } },
+        { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+      ]);
+      if (!agg || !agg.count) {
+        const { text, keyboard } = await buildDanaAlimView('ℹ️ Tidak ada catatan untuk di-reset.');
+        return safeEditOrReply(ctx, text, keyboard);
+      }
+      const text = '⚠️ *Reset Dana Alim ke Rp 0?*\n\n' +
+        `*${agg.count}* order senilai *${rpFmt(agg.total)}* akan ditandai *SUDAH DIBAYARKAN*.\n` +
+        'Data tetap disimpan sebagai riwayat.';
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Ya, reset', `dar_ok:${uptoMs}`)],
+        [Markup.button.callback('⬅️ Batal', 'admin_dana_alim')],
+      ]);
+      await safeEditOrReply(ctx, text, keyboard);
+    } catch (err) {
+      console.error('[DANA ALIM] ask error:', err);
+      ctx.reply('❌ Gagal menyiapkan reset.');
+    }
+  });
+
+  bot.action(/^dar_ok:(\d+)$/, adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    try {
+      const filter = { settled: false, createdAt: { $lte: new Date(Number(ctx.match[1])) } };
+      const [agg] = await AlimSale.aggregate([
+        { $match: filter },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+      const r = await AlimSale.updateMany(filter, { $set: { settled: true, settledAt: new Date() } });
+      const notice = r.modifiedCount > 0
+        ? `✅ Berhasil di-reset: *${r.modifiedCount}* order senilai *${rpFmt(agg ? agg.total : 0)}* ditandai sudah dibayarkan.`
+        : 'ℹ️ Tidak ada catatan yang di-reset (sudah di-reset sebelumnya).';
+      const { text, keyboard } = await buildDanaAlimView(notice);
+      await safeEditOrReply(ctx, text, keyboard);
+    } catch (err) {
+      console.error('[DANA ALIM] reset error:', err);
+      ctx.reply('❌ Gagal reset Dana Alim.');
     }
   });
   

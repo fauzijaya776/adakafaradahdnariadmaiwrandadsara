@@ -99,7 +99,23 @@ OrderSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_expiresA
 // Dipakai fitur 'Riwayat Transaksi' (sebelumnya collection scan tiap ditekan).
 OrderSchema.index({ 'customerInfo.telegramUserId': 1, status: 1 });
 
+// Catatan dana order tokotelealim (prefix ALIM-) yang masuk ke akun Pakasir
+// bersama. Hanya CATATAN: dipakai untuk tahu berapa yang harus dibayarkan ke
+// pemilik tokotelealim saat pencairan. settled=true artinya sudah di-reset
+// (sudah dibayarkan) — datanya tetap disimpan sebagai riwayat.
+const AlimSaleSchema = new mongoose.Schema({
+    orderId: { type: String, unique: true, required: true }, // kunci anti-dobel (webhook bisa dikirim ulang)
+    txnId: String,
+    amount: { type: Number, default: 0 },   // nominal dasar order (bagian tokotelealim)
+    completedAt: Date,
+    createdAt: { type: Date, default: Date.now },
+    settled: { type: Boolean, default: false },
+    settledAt: Date,
+});
+AlimSaleSchema.index({ settled: 1, createdAt: -1 });
+
 const Settings = mongoose.model('Settings', SettingsSchema);
+const AlimSale = mongoose.model('AlimSale', AlimSaleSchema);
 const Product = mongoose.model('Product', ProductSchema);
 const User = mongoose.model('User', UserSchema);
 const Order = mongoose.model('Order', OrderSchema);
@@ -134,5 +150,6 @@ module.exports = {
     User,
     Order,
     Settings,
+    AlimSale,
     slimPaymentDetails
 };

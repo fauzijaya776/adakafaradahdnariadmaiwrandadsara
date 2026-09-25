@@ -1,0 +1,95 @@
+<div class="max-w-4xl">
+    <% if (resetCount !== null && resetCount > 0) { %>
+        <div class="mb-6 text-sm rounded-lg px-4 py-3 bg-green-50 text-green-700 border border-green-100">
+            Berhasil di-reset: <b><%= resetCount %></b> catatan senilai
+            <b>Rp <%= Number(resetTotal || 0).toLocaleString('id-ID') %></b> ditandai sudah dibayarkan.
+        </div>
+    <% } else if (resetCount === 0) { %>
+        <div class="mb-6 text-sm rounded-lg px-4 py-3 bg-gray-50 text-gray-600 border border-gray-100">
+            Tidak ada catatan yang di-reset (sudah 0 atau sudah di-reset sebelumnya).
+        </div>
+    <% } %>
+
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h2 class="text-lg font-bold text-gray-800 mb-1">Dana tokotelealim (Alim Store)</h2>
+        <p class="text-sm text-gray-500 mb-5">
+            Catatan total order tokotelealim (ID berawalan <code class="text-xs bg-gray-100 px-1 rounded">ALIM-</code>)
+            yang sudah dibayar dan masuk ke akun Pakasir bersama. Dipakai untuk tahu berapa yang harus
+            dibayarkan saat pencairan. Hanya catatan — tidak memengaruhi saldo Pakasir.
+        </p>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+            <div class="rounded-lg border border-purple-100 bg-purple-50 p-5">
+                <div class="text-xs text-purple-700 mb-1">Total belum dibayarkan</div>
+                <div class="text-3xl font-bold text-purple-800">Rp <%= Number(total).toLocaleString('id-ID') %></div>
+            </div>
+            <div class="rounded-lg border border-gray-100 p-5">
+                <div class="text-xs text-gray-500 mb-1">Jumlah order tercatat</div>
+                <div class="text-3xl font-bold text-gray-800"><%= count %></div>
+            </div>
+        </div>
+
+        <form method="POST" action="/dana-alim/reset"
+              onsubmit="return confirm('Reset catatan ke Rp 0?\n\nTotal Rp <%= Number(total).toLocaleString('id-ID') %> (<%= count %> order) akan ditandai SUDAH DIBAYARKAN. Data tetap tersimpan di riwayat.');">
+            <input type="hidden" name="upto" value="<%= upto %>">
+            <button type="submit" <%= count === 0 ? 'disabled' : '' %>
+                class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2.5 px-5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed">
+                Reset ke 0 (sudah dibayarkan)
+            </button>
+        </form>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h3 class="text-sm font-semibold text-gray-700 mb-4">Order belum dibayarkan<% if (count > items.length) { %> (100 terbaru dari <%= count %>)<% } %></h3>
+        <% if (items.length === 0) { %>
+            <p class="text-sm text-gray-400">Belum ada catatan.</p>
+        <% } else { %>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-gray-500 border-b">
+                            <th class="py-2 pr-4 font-medium">Waktu (WIB)</th>
+                            <th class="py-2 pr-4 font-medium">ID Order</th>
+                            <th class="py-2 font-medium text-right">Nominal</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <% items.forEach(function (it) { %>
+                            <tr class="border-b last:border-0">
+                                <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.when %></td>
+                                <td class="py-2 pr-4 font-mono text-xs text-gray-700"><%= it.orderId %></td>
+                                <td class="py-2 text-right text-gray-800">Rp <%= Number(it.amount).toLocaleString('id-ID') %></td>
+                            </tr>
+                        <% }) %>
+                    </tbody>
+                </table>
+            </div>
+        <% } %>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6">
+        <h3 class="text-sm font-semibold text-gray-700 mb-4">Riwayat reset (10 terakhir)</h3>
+        <% if (history.length === 0) { %>
+            <p class="text-sm text-gray-400">Belum pernah di-reset.</p>
+        <% } else { %>
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-left text-gray-500 border-b">
+                        <th class="py-2 pr-4 font-medium">Di-reset pada (WIB)</th>
+                        <th class="py-2 pr-4 font-medium">Jumlah order</th>
+                        <th class="py-2 font-medium text-right">Total dibayarkan</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% history.forEach(function (h) { %>
+                        <tr class="border-b last:border-0">
+                            <td class="py-2 pr-4 text-gray-600"><%= h.when %></td>
+                            <td class="py-2 pr-4 text-gray-600"><%= h.count %></td>
+                            <td class="py-2 text-right text-gray-800">Rp <%= Number(h.total).toLocaleString('id-ID') %></td>
+                        </tr>
+                    <% }) %>
+                </tbody>
+            </table>
+        <% } %>
+    </div>
+</div>

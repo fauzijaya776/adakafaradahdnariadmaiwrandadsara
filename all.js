@@ -18,7 +18,7 @@ const mongoose = require('mongoose');
 const moment = require('moment-timezone');
 
 // Impor modul lokal
-const { connectDB, User, Product, Order, Settings, slimPaymentDetails } = require('./db');
+const { connectDB, User, Product, Order, Settings, AlimSale, slimPaymentDetails } = require('./db');
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const qrin = require('./qris_qrin');
@@ -776,6 +776,67 @@ app.post('/statusdo/run', authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("Status DO Run Error:", error);
         return res.status(500).json({ ok: false, message: error.message });
+    }
+});
+
+// --- Dana Alim (admin panel): CATATAN total order tokotelealim (ALIM-) yang masuk ---
+// ke akun Pakasir bersama, untuk tahu berapa yang harus dibayarkan saat pencairan.
+function fmtWIB(d) {
+    return d ? moment(d).tz('Asia/Jakarta').format('DD/MM/YY HH:mm') : '-';
+}
+
+app.get('/dana-alim', authMiddleware, async (req, res) => {
+    try {
+        const [agg] = await AlimSale.aggregate([
+            { $match: { settled: false } },
+            { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 }, latest: { $max: '$createdAt' } } },
+        ]);
+        const total = agg ? agg.total : 0;
+        const count = agg ? agg.count : 0;
+        const upto = agg && agg.latest ? new Date(agg.latest).toISOString() : '';
+
+        const items = await AlimSale.find({ settled: false }).sort({ createdAt: -1 }).limit(100).lean();
+        const history = await AlimSale.aggregate([
+            { $match: { settled: true, settledAt: { $ne: null } } },
+            { $group: { _id: '$settledAt', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+            { $sort: { _id: -1 } },
+            { $limit: 10 },
+        ]);
+
+        res.render('layout', {
+            page: 'dana-alim',
+            body: await ejs.renderFile(path.join(__dirname, 'views/dana-alim.ejs'), {
+                total, count, upto,
+                items: items.map(i => ({ orderId: i.orderId, amount: i.amount, when: fmtWIB(i.completedAt || i.createdAt) })),
+                history: history.map(h => ({ when: fmtWIB(h._id), total: h.total, count: h.count })),
+                resetCount: req.query.reset !== undefined ? (parseInt(req.query.reset, 10) || 0) : null,
+                resetTotal: req.query.rt !== undefined ? (parseInt(req.query.rt, 10) || 0) : null,
+            })
+        });
+    } catch (error) {
+        console.error("Dana Alim Page Error:", error);
+        res.status(500).send("Error loading Dana Alim page.");
+    }
+});
+
+// Reset ke 0 = tandai catatan sebagai SUDAH DIBAYARKAN (data tetap disimpan sbg riwayat).
+// Hanya catatan s/d `upto` (yang tampil di layar) yang di-reset, supaya order yang
+// baru masuk saat halaman sedang terbuka tidak ikut ter-reset tanpa terlihat.
+app.post('/dana-alim/reset', authMiddleware, async (req, res) => {
+    try {
+        const filter = { settled: false };
+        const upto = req.body && req.body.upto ? new Date(req.body.upto) : null;
+        if (upto && !isNaN(upto.getTime())) filter.createdAt = { $lte: upto };
+
+        const [agg] = await AlimSale.aggregate([
+            { $match: filter },
+            { $group: { _id: null, total: { $sum: '$amount' } } },
+        ]);
+        const r = await AlimSale.updateMany(filter, { $set: { settled: true, settledAt: new Date() } });
+        res.redirect(`/dana-alim?reset=${r.modifiedCount || 0}&rt=${agg ? agg.total : 0}`);
+    } catch (error) {
+        console.error("Dana Alim Reset Error:", error);
+        res.status(500).send("Error resetting Dana Alim.");
     }
 });
 // =================================================================
@@ -2185,6 +2246,51 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
 });
 
 // ===== Pemenuhan order Pakasir yang sudah dibayar (dipanggil polling / webhook) =====
+// ===== Catatan dana tokotelealim (order ALIM- yang masuk ke akun Pakasir bersama) =====
+// Idempoten: orderId unik, jadi webhook yang dikirim ulang tidak menghitung dobel.
+async function recordAlimSale(body) {
+    const orderId = String(body.order_id);
+    const txnId = body.txn_id ? String(body.txn_id) : null;
+    let amount = Number(body.amount) || 0;
+
+    // Lapis kedua: cek ulang status langsung ke Pakasir (X-Secret sudah lolos sebelumnya).
+    if (txnId) {
+        const detail = await pakasir.checkPaymentStatus(txnId);
+        if (detail) {
+            const st = String(detail.status || '').toLowerCase();
+            // Tolak HANYA bila Pakasir tegas menyatakan batal. 'pending' bisa sekadar jeda
+            // sinkronisasi sesaat setelah bayar; webhook sudah lolos X-Secret (asli dari
+            // Pakasir) dan tidak akan dikirim ulang bila kita balas 200 — jadi tetap dicatat
+            // agar tidak ada penjualan yang hilang dari catatan.
+            if (['canceled', 'cancelled', 'failed', 'expired'].includes(st)) {
+                return { recorded: false, reason: `status ${st}` };
+            }
+            if (detail.is_sandbox === true || detail.is_sandbox === 'true') {
+                return { recorded: false, reason: 'sandbox' };
+            }
+            if (Number(detail.amount) > 0) amount = Number(detail.amount);
+        }
+        // detail null (gangguan jaringan) -> tetap dicatat karena webhook sudah terverifikasi.
+    }
+    if (amount <= 0) return { recorded: false, reason: 'nominal kosong' };
+
+    let completedAt = body.completed_at ? new Date(body.completed_at) : new Date();
+    if (isNaN(completedAt.getTime())) completedAt = new Date();
+
+    const doc = { amount, completedAt, settled: false };
+    if (txnId) doc.txnId = txnId;
+
+    try {
+        const r = await AlimSale.updateOne({ orderId }, { $setOnInsert: doc }, { upsert: true });
+        return r.upsertedCount > 0
+            ? { recorded: true, amount }
+            : { recorded: false, reason: 'sudah tercatat sebelumnya' };
+    } catch (e) {
+        if (e && e.code === 11000) return { recorded: false, reason: 'sudah tercatat sebelumnya' };
+        throw e;
+    }
+}
+
 async function fulfillPakasirPaidOrder(orderId) {
     // Idempoten: hanya proses order yang MASIH PENDING (aman thd double polling+webhook).
     const order = await Order.findOneAndUpdate(
@@ -2349,6 +2455,22 @@ app.post(['/callback', '/qrin/callback', '/pakasir/callback'], async (req, res) 
             const status = String(body.status || '').toLowerCase();
             console.log(`[PAKASIR CALLBACK] order=${orderId} txn=${txnId} status=${status}`);
             if (!orderId) return res.status(400).json({ success: false, message: 'order_id missing' });
+
+            // PENANDA: order ber-prefix ALIM- adalah milik bot tokotelealim (berbagi akun
+            // Pakasir yang sama). tokotelealim mengonfirmasi & mengirim akun sendiri via
+            // polling, jadi bot ini TIDAK memproses order-nya — hanya MENCATAT nominalnya
+            // (halaman admin "Dana Alim") untuk tahu berapa yang harus dibayarkan.
+            if (String(orderId).startsWith('ALIM-')) {
+                // is_sandbox bisa datang sebagai boolean (JSON) atau string (form-urlencoded).
+                const isSandbox = body.is_sandbox === true || String(body.is_sandbox).toLowerCase() === 'true';
+                if (status === 'completed' && !isSandbox) {
+                    const r = await recordAlimSale(body);
+                    console.log(`[DANA ALIM] order ${orderId}: ${r.recorded ? 'dicatat Rp ' + r.amount : 'tidak dicatat (' + r.reason + ')'}`);
+                } else {
+                    console.log(`[PAKASIR CALLBACK] order ${orderId} milik tokotelealim (status=${status}${isSandbox ? ', sandbox' : ''}) — tidak dicatat.`);
+                }
+                return res.json({ success: true, alim: true });
+            }
 
             if (status === 'completed') {
                 // X-Secret sudah lolos; verifikasi ulang status ke Pakasir (pakai txn_id)

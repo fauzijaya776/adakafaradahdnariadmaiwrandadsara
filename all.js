@@ -27,6 +27,27 @@ const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const QRCode = require('qrcode');
 const docheck = require('./docheck');
+
+// Testimoni otomatis: struk bergambar diposting ke channel setiap order lunas & akun terkirim.
+// Channel default @FZISTORE; ganti lewat env TESTI_CHANNEL, atau matikan dengan TESTI_CHANNEL=off.
+// Butuh: npm install @napi-rs/canvas  (tanpa itu testimoni tetap diposting sebagai teks).
+const createTestimoni = require('./testimoni');
+const testimoni = createTestimoni({
+    channel: process.env.TESTI_CHANNEL !== undefined ? process.env.TESTI_CHANNEL : '@FZISTORE',
+    assetsDir: path.join(__dirname, 'testimoni-assets'),
+    brand: {
+        name1: 'FZI', name2: 'STORE', displayName: 'FZI STORE', monogram: 'F', trxPrefix: 'FZI',
+        tagline: 'Produk digital · Order otomatis 24 jam',
+        footer: 'Produk digital dikirim otomatis setelah pembayaran terkonfirmasi · fzistore.my.id',
+        feeLabel: 'Biaya QRIS',
+        logoFile: null, // tanpa file logo -> monogram "F" gradasi ungu-cyan (identitas web fzistore)
+        colors: { name1: '#6d4dff', name2: '#0891b2', dark: '#5b3fd9', grad: ['#7c5cff', '#22d3ee'], totalBg: ['#f1edff', '#e6f9fd'], heart: '#7c5cff' },
+    },
+    notifyOwner: async (text) => {
+        const owners = (process.env.OWNER_ID || '').split(',').map((id) => id.trim()).filter(Boolean);
+        for (const id of owners) await bot.telegram.sendMessage(id, text).catch(() => {});
+    },
+});
 // === 2. INISIALISASI & KONEKSI DATABASE ===
 connectDB(); 
 
@@ -365,8 +386,13 @@ async function deliverAccountsToCustomer(order, methodLabel) {
         const wasFirstDelivery = !order.delivered;
         await markOrderDelivered(order.orderId);
         if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
-        // Notif owner hanya saat pengiriman PERTAMA (bukan saat /resend).
-        if (wasFirstDelivery) await notifyOwnerNewOrder(order).catch(() => {});
+        // Notif owner + testimoni channel hanya saat pengiriman PERTAMA (bukan saat /resend).
+        if (wasFirstDelivery) {
+            await notifyOwnerNewOrder(order).catch(() => {});
+            // Testimoni ke channel — sengaja TIDAK di-await: posting ke channel tidak boleh
+            // menahan atau menggagalkan pengiriman akun ke customer.
+            testimoni.post(bot, order, methodLabel).catch((e) => console.error('[TESTI]', e.message));
+        }
         return true;
     } catch (err) {
         console.error(`[DELIVERY] GAGAL kirim akun order ${order.orderId}:`, err.message);
@@ -2143,6 +2169,8 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             orderId: payment.displayOrderId,
             realOrderId: payment.realOrderId,
             pakasirTxnId: payment.txnId,  // v2: dipakai cek status & rekonsiliasi
+            fee: payment.fee,                 // biaya QRIS (ditanggung customer)
+            totalPaid: payment.totalBayar,    // total yang dibayar customer
             internalRefId: internalOrderId,
             depositId: payment.realOrderId,
             amount: totalHarga,           // nominal dasar (diterima merchant) -> statistik

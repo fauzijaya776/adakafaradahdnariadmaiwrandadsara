@@ -35,6 +35,7 @@ const createTestimoni = require('./testimoni');
 const testimoni = createTestimoni({
     channel: process.env.TESTI_CHANNEL !== undefined ? process.env.TESTI_CHANNEL : '@FZISTORE',
     assetsDir: path.join(__dirname, 'testimoni-assets'),
+    Order, // antrean testimoni disimpan di dokumen Order (tahan restart + coba ulang)
     brand: {
         name1: 'FZI', name2: 'STORE', displayName: 'FZI STORE', monogram: 'F', trxPrefix: 'FZI',
         tagline: 'Produk digital · Order otomatis 24 jam',
@@ -42,6 +43,11 @@ const testimoni = createTestimoni({
         feeLabel: 'Biaya QRIS',
         logoFile: null, // tanpa file logo -> monogram "F" gradasi ungu-cyan (identitas web fzistore)
         colors: { name1: '#6d4dff', name2: '#0891b2', dark: '#5b3fd9', grad: ['#7c5cff', '#22d3ee'], totalBg: ['#f1edff', '#e6f9fd'], heart: '#7c5cff' },
+    },
+    // Mode senyap (default ON) — diatur owner lewat Admin Panel Telegram -> "Testimoni Senyap".
+    isSilent: async () => {
+        const st = await Settings.findOne({ identifier: 'global-settings' }).lean();
+        return st && typeof st.testi_silent === 'boolean' ? st.testi_silent : true;
     },
     notifyOwner: async (text) => {
         const owners = (process.env.OWNER_ID || '').split(',').map((id) => id.trim()).filter(Boolean);
@@ -54,6 +60,22 @@ connectDB();
 // Inisialisasi Express App dan Telegraf Bot
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
+// Tombol "Matikan notifikasi" di bawah setiap testimoni channel. Didaftarkan PALING AWAL
+// supaya subscriber channel yang menekannya tidak ikut tercatat sebagai user bot.
+testimoni.attach(bot);
+
+// /testiulang <ID order> — kirim ulang testimoni order tertentu ke channel (khusus owner).
+// Berguna untuk order yang testimoninya terlanjur tidak masuk sebelum antrean ada.
+bot.command('testiulang', async (ctx) => {
+    const owners = (process.env.OWNER_ID || '').split(',').map((id) => id.trim()).filter(Boolean);
+    if (!owners.includes(String(ctx.from.id))) return;
+    const orderId = (ctx.message.text.split(/\s+/)[1] || '').trim();
+    if (!orderId) {
+        return ctx.reply('Format: /testiulang <ID order>\nContoh: /testiulang P-123456789-1790000061337\n(ID order ada di notifikasi "Order Baru")');
+    }
+    const r = await testimoni.repost(bot, orderId).catch((e) => ({ posted: false, reason: e.message }));
+    return ctx.reply(r.posted ? `✅ Testimoni ${orderId} berhasil diposting ke channel.` : `❌ Testimoni ${orderId} tidak diposting: ${r.reason}`);
+});
 const PORT = process.env.PORT || 3000;
 const GROUP_NOTIF_ID = process.env.GROUP_NOTIF_ID;
 
@@ -391,7 +413,7 @@ async function deliverAccountsToCustomer(order, methodLabel) {
             await notifyOwnerNewOrder(order).catch(() => {});
             // Testimoni ke channel — sengaja TIDAK di-await: posting ke channel tidak boleh
             // menahan atau menggagalkan pengiriman akun ke customer.
-            testimoni.post(bot, order, methodLabel).catch((e) => console.error('[TESTI]', e.message));
+            testimoni.enqueue(bot, order, methodLabel).catch((e) => console.error('[TESTI]', e.message));
         }
         return true;
     } catch (err) {

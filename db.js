@@ -56,6 +56,13 @@ const OrderSchema = new mongoose.Schema({
     // Rincian bayar (dipakai struk testimoni): biaya QRIS & total yang dibayar customer.
     fee: Number,
     totalPaid: Number,
+    // Pemantauan Pakasir (pembayaran telat / setelah restart) — lihat sweepPakasirOrders().
+    pakasirCheckedAt: Date,   // terakhir dicek ke Pakasir oleh sweeper
+    pakasirFinal: Boolean,    // Pakasir sudah bilang canceled/expired -> tidak dicek lagi
+    latePaid: Boolean,        // dibayar SETELAH invoice kedaluwarsa/dibatalkan (tetap dikirim)
+    qrMsgId: Number,          // id pesan QRIS di chat pembeli (dihapus setelah lunas/kedaluwarsa)
+    gmailResultMsgId: Number, // id pesan "Pengecekan Otomatis Selesai" di chat pembeli
+    gmailUnverified: Number,  // jumlah akun Gmail yang terkirim tanpa lolos cek live
     // Antrean testimoni channel (tahan restart & coba ulang otomatis). Lihat testimoni.js.
     testiQueuedAt: Date,    // kapan masuk antrean (akun pertama kali terkirim)
     testiPostedAt: Date,    // kapan berhasil diposting ke channel
@@ -112,6 +119,8 @@ OrderSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_expiresA
 
 // Dipakai fitur 'Riwayat Transaksi' (sebelumnya collection scan tiap ditekan).
 OrderSchema.index({ 'customerInfo.telegramUserId': 1, status: 1 });
+// Dipakai sweeper Pakasir (cek ulang order 24 jam terakhir).
+OrderSchema.index({ paymentGateway: 1, status: 1, createdAt: -1 });
 
 // Dipakai penyapu antrean testimoni (hanya order yang pernah masuk antrean).
 OrderSchema.index({ testiQueuedAt: 1 }, { sparse: true });

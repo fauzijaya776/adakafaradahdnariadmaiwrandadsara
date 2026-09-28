@@ -18,7 +18,7 @@ const mongoose = require('mongoose');
 const moment = require('moment-timezone');
 
 // Impor modul lokal
-const { connectDB, User, Product, Order, Settings, AlimSale, slimPaymentDetails } = require('./db');
+const { connectDB, User, Product, Order, Settings, AlimSale, GmailCheck, GmailDead, slimPaymentDetails } = require('./db');
 const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const qrin = require('./qris_qrin');
@@ -54,6 +54,10 @@ const testimoni = createTestimoni({
         for (const id of owners) await bot.telegram.sendMessage(id, text).catch(() => {});
     },
 });
+// Cek Gmail live (QuickEmailVerification) sebelum QRIS dibuat — khusus produk/varian Gmail.
+// Butuh env QEV_API_KEY. Detail & pengaturan: gmailcheck.js, Panel Admin -> "📧 Cek Gmail", /cekgmail.
+const createGmailCheck = require('./gmailcheck');
+const gmailcheck = createGmailCheck({ Product, Settings, GmailCheck, GmailDead });
 // === 2. INISIALISASI & KONEKSI DATABASE ===
 connectDB(); 
 
@@ -76,6 +80,8 @@ bot.command('testiulang', async (ctx) => {
     const r = await testimoni.repost(bot, orderId).catch((e) => ({ posted: false, reason: e.message }));
     return ctx.reply(r.posted ? `✅ Testimoni ${orderId} berhasil diposting ke channel.` : `❌ Testimoni ${orderId} tidak diposting: ${r.reason}`);
 });
+// Cek Gmail live: /cekgmail + menu "📧 Cek Gmail" (khusus owner).
+gmailcheck.attach(bot);
 const PORT = process.env.PORT || 3000;
 const GROUP_NOTIF_ID = process.env.GROUP_NOTIF_ID;
 
@@ -1659,6 +1665,9 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     const variantSlug = ctx.match[2];
     const quantity = parseInt(ctx.match[3]);
     const internalOrderId = `WXSID-${ctx.from.id}-${Date.now()}`;
+    // Cek akun Gmail live dulu (hanya varian Gmail) SEBELUM stok direservasi & QRIS dibuat.
+    const gmailPre = await gmailcheck.precheck(ctx, productId, variantSlug, quantity);
+    if (!gmailPre.proceed) return;
     let reservedItems = [];
     let transactionCommitted = false; // <-- Penanda baru
 
@@ -1677,8 +1686,8 @@ bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             throw new Error('Maaf, stok tidak mencukupi.');
         }
 
-        reservedItems = variant.stock.slice(0, quantity);
-        variant.stock.splice(0, quantity);
+        // Ambil stok: dahulukan akun Gmail yang sudah lolos cek (produk lain: dari depan seperti biasa).
+        reservedItems = gmailcheck.takeFromStock(variant, quantity, gmailPre.preferred);
         variant.reserved_stock.push(...reservedItems);
         await product.save({ session });
 
@@ -1805,6 +1814,9 @@ bot.action(/^qris_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     const variantSlug = ctx.match[2];
     const quantity = parseInt(ctx.match[3]);
     const internalOrderId = `WXSID-${ctx.from.id}-${Date.now()}`;
+    // Cek akun Gmail live dulu (hanya varian Gmail) SEBELUM stok direservasi & QRIS dibuat.
+    const gmailPre = await gmailcheck.precheck(ctx, productId, variantSlug, quantity);
+    if (!gmailPre.proceed) return;
     let reservedItems = [];
     let transactionCommitted = false; // <-- Penanda baru
 
@@ -1823,8 +1835,8 @@ bot.action(/^qris_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             throw new Error('Maaf, stok tidak mencukupi.');
         }
 
-        reservedItems = variant.stock.slice(0, quantity);
-        variant.stock.splice(0, quantity);
+        // Ambil stok: dahulukan akun Gmail yang sudah lolos cek (produk lain: dari depan seperti biasa).
+        reservedItems = gmailcheck.takeFromStock(variant, quantity, gmailPre.preferred);
         variant.reserved_stock.push(...reservedItems);
         await product.save({ session });
 
@@ -1949,6 +1961,9 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     const variantSlug = ctx.match[2];
     const quantity = parseInt(ctx.match[3]);
     const internalOrderId = `G-${ctx.from.id}-${Date.now()}`;
+    // Cek akun Gmail live dulu (hanya varian Gmail) SEBELUM stok direservasi & QRIS dibuat.
+    const gmailPre = await gmailcheck.precheck(ctx, productId, variantSlug, quantity);
+    if (!gmailPre.proceed) return;
     let reservedItems = [];
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1965,8 +1980,8 @@ bot.action(/^tokopay_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             throw new Error('Maaf, stok tidak mencukupi.');
         }
 
-        reservedItems = variant.stock.slice(0, quantity);
-        variant.stock.splice(0, quantity);
+        // Ambil stok: dahulukan akun Gmail yang sudah lolos cek (produk lain: dari depan seperti biasa).
+        reservedItems = gmailcheck.takeFromStock(variant, quantity, gmailPre.preferred);
         variant.reserved_stock.push(...reservedItems);
         await product.save({ session });
 
@@ -2142,6 +2157,9 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     const variantSlug = ctx.match[2];
     const quantity = parseInt(ctx.match[3]);
     const internalOrderId = `P-${ctx.from.id}-${Date.now()}`;
+    // Cek akun Gmail live dulu (hanya varian Gmail) SEBELUM stok direservasi & QRIS dibuat.
+    const gmailPre = await gmailcheck.precheck(ctx, productId, variantSlug, quantity);
+    if (!gmailPre.proceed) return;
     let reservedItems = [];
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -2158,8 +2176,8 @@ bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
             throw new Error('Maaf, stok tidak mencukupi.');
         }
 
-        reservedItems = variant.stock.slice(0, quantity);
-        variant.stock.splice(0, quantity);
+        // Ambil stok: dahulukan akun Gmail yang sudah lolos cek (produk lain: dari depan seperti biasa).
+        reservedItems = gmailcheck.takeFromStock(variant, quantity, gmailPre.preferred);
         variant.reserved_stock.push(...reservedItems);
         await product.save({ session });
 

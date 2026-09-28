@@ -105,6 +105,7 @@ async function getAdminMenuMessageAndKeyboard() {
     [Markup.button.callback('💳 Buat Transfer', 'admin_tf')],
     [Markup.button.callback('🧾 Cek Saldo', 'admin_profile')],
     [Markup.button.callback('💵 Dana Alim', 'admin_dana_alim')],
+    [Markup.button.callback('📧 Cek Gmail', 'admin_gmail')],
     [Markup.button.callback(testiSilent ? '🔕 Testimoni Senyap: ON' : '🔔 Testimoni Senyap: OFF', 'admin_testi_silent')],
     [Markup.button.callback('⬅️ Kembali ke Menu Utama', 'back_to_start')]
   ]);

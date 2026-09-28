@@ -94,6 +94,8 @@ const SettingsSchema = new mongoose.Schema({
     tokopay_enabled: { type: Boolean, default: true },
     // Testimoni channel dikirim tanpa bunyi (default ON). Diubah lewat Admin Panel Telegram.
     testi_silent: { type: Boolean, default: true },
+    // Cek Gmail live (QuickEmailVerification) sebelum QRIS dibuat. Diubah lewat Admin Panel Telegram.
+    gmailcheck_enabled: { type: Boolean, default: true },
 });
 
 // =============================================================
@@ -129,7 +131,36 @@ const AlimSaleSchema = new mongoose.Schema({
 });
 AlimSaleSchema.index({ settled: 1, createdAt: -1 });
 
+// Cache hasil cek Gmail (QuickEmailVerification) per alamat email, supaya akun
+// yang baru dicek tidak memakan kuota lagi (mis. pembeli batal lalu dibeli orang lain).
+// Dihapus otomatis oleh MongoDB setelah expireAt (hemat storage).
+const GmailCheckSchema = new mongoose.Schema({
+    email: { type: String, unique: true, required: true }, // huruf kecil
+    status: { type: String, enum: ['live', 'dead'] },
+    reason: String,
+    checkedAt: Date,
+    expireAt: Date,
+});
+GmailCheckSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
+
+// "Stok mati": akun Gmail yang terdeteksi mati/di-disable dan dikeluarkan otomatis
+// dari stok. Disimpan (tidak dihapus) supaya owner bisa cek/klaim garansi ke supplier.
+const GmailDeadSchema = new mongoose.Schema({
+    item: String,          // baris stok lengkap (email|password|...)
+    email: String,
+    reason: String,
+    productId: String,
+    variantSlug: String,
+    productName: String,
+    variantName: String,
+    removedAt: { type: Date, default: Date.now },
+    handled: { type: Boolean, default: false }, // true = sudah diurus owner
+});
+GmailDeadSchema.index({ handled: 1, removedAt: -1 });
+
 const Settings = mongoose.model('Settings', SettingsSchema);
+const GmailCheck = mongoose.model('GmailCheck', GmailCheckSchema);
+const GmailDead = mongoose.model('GmailDead', GmailDeadSchema);
 const AlimSale = mongoose.model('AlimSale', AlimSaleSchema);
 const Product = mongoose.model('Product', ProductSchema);
 const User = mongoose.model('User', UserSchema);
@@ -166,5 +197,7 @@ module.exports = {
     Order,
     Settings,
     AlimSale,
+    GmailCheck,
+    GmailDead,
     slimPaymentDetails
 };

@@ -58,6 +58,13 @@ const testimoni = createTestimoni({
 // Butuh env QEV_API_KEY. Detail & pengaturan: gmailcheck.js, Panel Admin -> "📧 Cek Gmail", /cekgmail.
 const createGmailCheck = require('./gmailcheck');
 const gmailcheck = createGmailCheck({ Product, Settings, GmailCheck, GmailDead });
+// Daftar pembeli DigitalOcean + template "bot pindah" (panel web /pembeli-do & panel admin Telegram).
+const createPembeliDo = require('./pembelido');
+const pembeliDo = createPembeliDo({
+    Order, Product, User, Settings,
+    storeName: 'FZI STORE',
+    channel: process.env.TESTI_CHANNEL && !/^off$/i.test(process.env.TESTI_CHANNEL) ? process.env.TESTI_CHANNEL : '@FZISTORE',
+});
 // === 2. INISIALISASI & KONEKSI DATABASE ===
 connectDB(); 
 
@@ -883,6 +890,9 @@ app.post('/assets/replace', authMiddleware, (req, res) => {
     });
 });
 
+// Halaman "Pembeli DO": daftar pembeli DigitalOcean + template pindah bot.
+pembeliDo.registerRoutes(app, authMiddleware, ejs, path, path.join(__dirname, 'views'));
+
 app.get('/payment-gateways', authMiddleware, async (req, res) => {
     try {
         let settings = await Settings.findOneAndUpdate(
@@ -1031,6 +1041,16 @@ app.post('/dana-alim/reset', authMiddleware, async (req, res) => {
 // =================================================================
 // BAGIAN B: KODE TELEGRAM BOT (DARI bot.js)
 // =================================================================
+
+// Wajib join channel testimoni sebelum memakai bot (owner dikecualikan).
+// Bot harus ADMIN di channel. Atur lewat env FORCE_JOIN_CHANNEL (isi "off" untuk mematikan).
+const createForceJoin = require('./forcejoin');
+createForceJoin({
+    channel: process.env.TESTI_CHANNEL !== undefined ? process.env.TESTI_CHANNEL : '@FZISTORE',
+    storeName: 'FZI STORE',
+}).attach(bot);
+
+pembeliDo.attach(bot);
 
 adminModule(bot);
 

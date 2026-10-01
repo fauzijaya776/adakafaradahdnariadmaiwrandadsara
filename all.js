@@ -2931,7 +2931,9 @@ app.get(['/health', '/ping'], (req, res) => res.status(200).send('OK'));
 
 // Menangani DUA gateway pada satu route:
 //  - PAKASIR v2 : POST dengan header X-Secret, body { txn_id, order_id, status:"completed", amount, ... }
-//                 URL webhook di dashboard Pakasir: https://fzistore.my.id/callback (atau /pakasir/callback).
+//                 URL webhook di dashboard Pakasir: https://NAMA-BOT.onrender.com/pakasir/callback
+//                 (alamat Render bot ini). JANGAN https://fzistore.my.id/callback — domain itu sekarang
+//                 milik website FZI (Vercel); webhook hanya sampai ke bot bila BOT_CALLBACK_URL diisi di sana.
 //                 CATATAN: webhook Pakasir OPSIONAL — bot juga polling status sendiri,
 //                 jadi pembayaran tetap terkonfirmasi walau webhook tidak diset.
 //  - QRIN       : POST dengan header X-Callback-Signature, body { no_ref_merchant, status:"success" }

@@ -7,18 +7,20 @@
 // TIDAK punya endpoint untuk mendaftar transaksi, jadi bot tidak bisa menanyakan
 // "order apa saja yang sudah masuk".
 //
-// Solusinya: baca order Alim yang sudah LUNAS langsung dari database Alim (database yang
-// sama dipakai bot tokotelealim @cloudalimbot dan website alimcloud.id):
-//   - koleksi `orders`     -> order bot Telegram  (ALIM-<idTelegram>-<waktu>)
-//   - koleksi `web_orders` -> order website       (WEBALIM-XXXXXXXXXX)
-// lalu SETIAP order dicek ulang ke Pakasir lewat txn_id sebelum dicatat. Hanya yang benar-benar
-// `completed`, order_id-nya cocok, dan bukan sandbox yang masuk catatan. Nominal diambil dari
-// Pakasir (bukan dari database Alim), jadi catatan tidak bisa digelembungkan dari sisi Alim.
+// Solusinya: tarik daftar order Alim yang sudah LUNAS (bot Telegram ALIM-<idTelegram>-<waktu>
+// dan website WEBALIM-XXXXXXXXXX), lalu SETIAP order dicek ulang ke Pakasir lewat txn_id
+// sebelum dicatat. Hanya yang benar-benar `completed`, order_id-nya cocok, dan bukan sandbox
+// yang masuk catatan. Nominal diambil dari Pakasir, jadi catatan tidak bisa digelembungkan.
 //
-// Database Alim hanya DIBACA, tidak pernah ditulis.
-// Aktif bila env ALIM_MONGO_URI diisi (salin MONGO_URI dari Environment bot tokotelealim /
-// website Alim). Tanpa itu, Dana Alim tetap jalan lewat webhook seperti sebelumnya.
+// Sumber daftar (otomatis, tanpa Environment baru):
+//   1. ALIM_MONGO_URI diisi -> baca langsung database Alim (koleksi `orders` & `web_orders`, read-only).
+//   2. selain itu           -> feed website Alim https://alimcloud.id/api/alim/paid, ditandatangani
+//                              HMAC dengan kunci turunan PAKASIR_API_KEY (sama di kedua sisi karena
+//                              project Pakasir-nya sama). ALIM_FEED_URL=off untuk mematikan;
+//                              ALIM_FEED_SECRET (opsional, isi sama di website Alim) untuk kunci terpisah.
 // ALIM_SYNC_DAYS (opsional, default 3) = berapa hari ke belakang yang dicek tiap sinkron.
+const crypto = require('crypto');
+const axios = require('axios');
 const mongoose = require('mongoose');
 const pakasir = require('./qris_pakasir');
 const { AlimSale, Settings } = require('./db');
@@ -34,7 +36,21 @@ const PROJECTION = {
     pakasirTxnId: 1, txnId: 1, 'paymentDetails.txn_id': 1,
 };
 
-const isEnabled = () => !!process.env.ALIM_MONGO_URI;
+const FEED_URL = String(process.env.ALIM_FEED_URL || 'https://alimcloud.id/api/alim/paid').trim();
+
+function feedKey() {
+    const base = String(process.env.ALIM_FEED_SECRET || process.env.PAKASIR_API_KEY || '').trim();
+    return base ? crypto.createHash('sha256').update('alim-feed|' + base).digest() : null;
+}
+
+// 'db' | 'feed' | null (nonaktif)
+function source() {
+    if (process.env.ALIM_MONGO_URI) return 'db';
+    if (FEED_URL && FEED_URL.toLowerCase() !== 'off' && feedKey()) return 'feed';
+    return null;
+}
+const SOURCE_LABEL = { db: 'database Alim', feed: 'website Alim (alimcloud.id)' };
+const isEnabled = () => !!source();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------- koneksi (read-only) ke database Alim ----------------
@@ -42,7 +58,7 @@ let alimConn = null;
 let connecting = null;
 
 async function alimDb() {
-    if (!isEnabled()) return null;
+    if (!process.env.ALIM_MONGO_URI) return null;
     if (alimConn) return alimConn.db; // driver menyambung ulang sendiri bila putus
     if (!connecting) {
         const c = mongoose.createConnection(process.env.ALIM_MONGO_URI, {
@@ -57,6 +73,54 @@ async function alimDb() {
     }
     const c = await connecting;
     return c.db;
+}
+
+// ---------------- feed website Alim (ditandatangani HMAC) ----------------
+async function fetchFeed({ days = '', id = '' }) {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = crypto.createHmac('sha256', feedKey()).update(`${ts}|${days}|${id}`).digest('hex');
+    const params = {};
+    if (days) params.days = days;
+    if (id) params.id = id;
+    let res;
+    try {
+        res = await axios.get(FEED_URL, { params, headers: { 'X-Alim-Ts': ts, 'X-Alim-Sig': sig }, timeout: 25000 });
+    } catch (e) {
+        const st = e.response ? e.response.status : null;
+        const hint = st === 401 ? ' (kunci tidak cocok: PAKASIR_API_KEY di Render & Vercel website Alim harus sama, atau isi ALIM_FEED_SECRET yang sama di keduanya)' : '';
+        throw new Error(`feed website Alim ${st ? 'HTTP ' + st : e.message}${hint}`);
+    }
+    const list = res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
+    if (!list) throw new Error('feed website Alim: format jawaban tidak dikenal');
+    return list.map((o) => ({
+        orderId: String(o.orderId), pakasirTxnId: o.txnId || null, status: o.status, amount: o.amount,
+        paidAt: o.paidAt ? new Date(o.paidAt) : null, createdAt: o.createdAt ? new Date(o.createdAt) : null,
+        paymentGateway: o.gateway || null,
+    }));
+}
+
+// Daftar order Alim yang sudah lunas sejak `since` (sumber db / feed).
+async function listPaidAlimOrders(since) {
+    if (source() === 'feed') return fetchFeed({ days: String(SYNC_DAYS) });
+    const db = await alimDb();
+    const when = { $or: [{ paidAt: { $gte: since } }, { createdAt: { $gte: since } }] };
+    const [web, tele] = await Promise.all([
+        db.collection(WEB_COLLECTION)
+            .find({ orderId: { $regex: '^WEBALIM-' }, status: { $in: WEB_PAID }, ...when })
+            .project(PROJECTION).sort({ createdAt: -1 }).limit(1000).toArray(),
+        db.collection(BOT_COLLECTION)
+            .find({ orderId: { $regex: '^ALIM-' }, status: { $in: BOT_PAID }, ...when })
+            .project(PROJECTION).sort({ createdAt: -1 }).limit(1000).toArray(),
+    ]);
+    return web.concat(tele);
+}
+
+// Satu order Alim (status apa pun) atau null.
+async function findAlimOrder(id) {
+    if (source() === 'feed') return (await fetchFeed({ id }))[0] || null;
+    const db = await alimDb();
+    const coll = sourceOf(id) === 'web' ? WEB_COLLECTION : BOT_COLLECTION;
+    return db.collection(coll).findOne({ orderId: id }, { projection: PROJECTION });
 }
 
 function txnOf(doc) {
@@ -125,27 +189,18 @@ let lastRun = null;
 let lastNoTxnLog = ''; // log peringatan "tanpa txn_id" hanya saat daftarnya berubah
 
 async function runSync() {
-    const db = await alimDb();
-    if (!db) return { enabled: false };
+    if (!isEnabled()) return { enabled: false };
 
     const since = new Date(Date.now() - SYNC_DAYS * 24 * 60 * 60 * 1000);
-    const when = { $or: [{ paidAt: { $gte: since } }, { createdAt: { $gte: since } }] };
-    const [web, tele] = await Promise.all([
-        db.collection(WEB_COLLECTION)
-            .find({ orderId: { $regex: '^WEBALIM-' }, status: { $in: WEB_PAID }, ...when })
-            .project(PROJECTION).sort({ createdAt: -1 }).limit(1000).toArray(),
-        db.collection(BOT_COLLECTION)
-            .find({ orderId: { $regex: '^ALIM-' }, status: { $in: BOT_PAID }, ...when })
-            .project(PROJECTION).sort({ createdAt: -1 }).limit(1000).toArray(),
-    ]);
-    const candidates = web.concat(tele);
+    const candidates = (await listPaidAlimOrders(since))
+        .filter((d) => /^(ALIM|WEBALIM)-/.test(String(d.orderId || '')));
     const ids = candidates.map((d) => String(d.orderId));
     const have = new Set(ids.length
         ? (await AlimSale.find({ orderId: { $in: ids } }, { orderId: 1 }).lean()).map((d) => d.orderId)
         : []);
 
     const summary = {
-        enabled: true, days: SYNC_DAYS,
+        enabled: true, days: SYNC_DAYS, source: source(),
         scanned: candidates.length, alreadyRecorded: have.size,
         recorded: 0, recordedAmount: 0, recordedIds: [],
         pending: 0, failed: 0, deferred: 0, noTxn: [], rejected: [],
@@ -223,9 +278,7 @@ async function syncAlimOrder(rawId) {
     if (/^[A-Z0-9]{10}$/.test(id)) id = 'WEBALIM-' + id; // 10 karakter terakhir pesanan web
     if (!/^(WEBALIM|ALIM)-[A-Z0-9-]+$/.test(id)) return { enabled: true, found: false, orderId: id };
     try {
-        const db = await alimDb();
-        const coll = sourceOf(id) === 'web' ? WEB_COLLECTION : BOT_COLLECTION;
-        const doc = await db.collection(coll).findOne({ orderId: id }, { projection: PROJECTION });
+        const doc = await findAlimOrder(id);
         if (!doc) return { enabled: true, found: false, orderId: id };
         // Dicek ke Pakasir walau status di database Alim belum PAID (bisa jadi bayar telat).
         const r = await verifyAndRecord(doc);
@@ -251,8 +304,11 @@ function noteWebhook(kind) {
 async function alimSyncStatus() {
     const st = await Settings.findOne({ identifier: 'global-settings' },
         { pakasir_webhook_ok_at: 1, pakasir_webhook_rejected_at: 1 }).lean().catch(() => null);
+    const src = source();
     return {
-        enabled: isEnabled(),
+        enabled: !!src,
+        source: src,
+        sourceLabel: src ? SOURCE_LABEL[src] : '',
         days: SYNC_DAYS,
         lastRun,
         webhookOkAt: st && st.pakasir_webhook_ok_at ? st.pakasir_webhook_ok_at : null,

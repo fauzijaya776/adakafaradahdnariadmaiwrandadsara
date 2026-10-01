@@ -1031,7 +1031,7 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
 
         const sync = await alimSync.alimSyncStatus();
         const syncView = {
-            enabled: sync.enabled, days: sync.days,
+            enabled: sync.enabled, days: sync.days, sourceLabel: sync.sourceLabel,
             last: sync.lastRun ? {
                 when: fmtWIB(sync.lastRun.at), ok: sync.lastRun.ok, error: sync.lastRun.error || '',
                 scanned: sync.lastRun.scanned || 0, recorded: sync.lastRun.recorded || 0,
@@ -2931,9 +2931,10 @@ app.get(['/health', '/ping'], (req, res) => res.status(200).send('OK'));
 
 // Menangani DUA gateway pada satu route:
 //  - PAKASIR v2 : POST dengan header X-Secret, body { txn_id, order_id, status:"completed", amount, ... }
-//                 URL webhook di dashboard Pakasir: https://NAMA-BOT.onrender.com/pakasir/callback
-//                 (alamat Render bot ini). JANGAN https://fzistore.my.id/callback — domain itu sekarang
-//                 milik website FZI (Vercel); webhook hanya sampai ke bot bila BOT_CALLBACK_URL diisi di sana.
+//                 URL webhook di dashboard Pakasir: https://fzistore.my.id/callback. Domain itu kini
+//                 milik website FZI (Vercel), yang memproses order W-, mencatat order ALIM-/WEBALIM-
+//                 langsung ke Dana Alim (koleksi alimsales), dan meneruskan sisanya ke bot ini hanya
+//                 bila BOT_CALLBACK_URL diisi di Vercel. Order bot (P-) tetap dicek lewat polling/sweeper.
 //                 CATATAN: webhook Pakasir OPSIONAL — bot juga polling status sendiri,
 //                 jadi pembayaran tetap terkonfirmasi walau webhook tidak diset.
 //  - QRIN       : POST dengan header X-Callback-Signature, body { no_ref_merchant, status:"success" }
@@ -4168,13 +4169,13 @@ if (ADMIN_DEFAULT_LOGIN) {
 // Cek ulang berkala: pembayaran telat / setelah restart tetap diproses.
 setInterval(sweepPakasirOrders, 2 * 60 * 1000);
 
-// Dana Alim: tarik order Alim yang sudah lunas dari database Alim (lapis cadangan bila
-// webhook Pakasir tidak sampai). Hanya jalan bila ALIM_MONGO_URI diisi. Lihat alimsync.js.
+// Dana Alim: tarik order Alim yang sudah lunas (feed alimcloud.id / database Alim) sebagai
+// lapis cadangan bila webhook Pakasir tidak sampai. Lihat alimsync.js.
 if (alimSync.isEnabled()) {
     setTimeout(() => alimSync.syncAlimSales(), 45 * 1000);
     setInterval(() => alimSync.syncAlimSales(), 3 * 60 * 1000);
 } else {
-    console.warn('[DANA ALIM] ALIM_MONGO_URI belum diisi -> Dana Alim hanya dari webhook Pakasir (tanpa sinkron cadangan).');
+    console.warn('[DANA ALIM] sinkron data Alim nonaktif -> Dana Alim hanya dari webhook Pakasir.');
 }
 
 // Pengecekan akun DigitalOcean di stok: sekali saat start (ditunda 60 detik

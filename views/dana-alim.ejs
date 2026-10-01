@@ -68,22 +68,18 @@
         <h3 class="text-sm font-semibold text-gray-700 mb-3">Sinkronisasi data Alim</h3>
         <% if (!sync.enabled) { %>
             <div class="text-sm rounded-lg px-4 py-3 bg-yellow-50 text-yellow-800 border border-yellow-100 mb-3">
-                <b>Belum aktif.</b> Saat ini Dana Alim hanya terisi dari webhook Pakasir. Kalau webhook tidak sampai ke bot ini,
-                order Alim tidak tercatat walaupun di dashboard Pakasir sudah <i>completed</i>.<br>
-                Supaya semua order Alim (bot Telegram &amp; website) selalu tercatat, isi
-                <code class="text-xs bg-yellow-100 px-1 rounded">ALIM_MONGO_URI</code> di Environment Render
-                (salin <code class="text-xs bg-yellow-100 px-1 rounded">MONGO_URI</code> dari bot tokotelealim / website Alim), lalu deploy ulang.
+                <b>Nonaktif</b> (<code class="text-xs bg-yellow-100 px-1 rounded">ALIM_FEED_URL=off</code>). Dana Alim hanya terisi dari webhook Pakasir;
+                kalau webhook tidak sampai, order Alim tidak tercatat walaupun di dashboard Pakasir sudah <i>completed</i>.
             </div>
         <% } else { %>
             <p class="text-sm text-gray-500 mb-3">
-                Tiap 3 menit bot membaca order Alim yang sudah lunas (<%= sync.days %> hari terakhir) dari database Alim,
+                Tiap 3 menit bot membaca order Alim yang sudah lunas (<%= sync.days %> hari terakhir) dari <b><%= sync.sourceLabel %></b>,
                 mengecek ulang ke Pakasir, lalu mencatat yang belum tercatat. Tidak bergantung pada webhook.
             </p>
             <% if (sync.last) { %>
                 <% if (!sync.last.ok) { %>
                     <div class="text-sm rounded-lg px-4 py-3 bg-red-50 text-red-700 border border-red-100 mb-3">
-                        Sinkron terakhir (<%= sync.last.when %>) gagal: <span class="font-mono text-xs"><%= sync.last.error %></span><br>
-                        Cek <code class="text-xs">ALIM_MONGO_URI</code> dan Network Access MongoDB Atlas milik Alim (izinkan IP Render / 0.0.0.0/0).
+                        Sinkron terakhir (<%= sync.last.when %>) gagal: <span class="font-mono text-xs"><%= sync.last.error %></span>
                     </div>
                 <% } else { %>
                     <p class="text-sm text-gray-600 mb-2">

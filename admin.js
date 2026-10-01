@@ -178,7 +178,7 @@ async function buildAlimTrackText(rawInput) {
       found: false,
       text: `🔎 *Lacak pesanan Alim*\n\nID \`${mdSafe(q)}\` *tidak ada di catatan Dana Alim*.\n\n` +
         'Kemungkinan:\n• pesanan belum dibayar / dibatalkan,\n• notifikasi Pakasir belum masuk (tunggu sebentar),\n• ID salah ketik.\n\n' +
-        '⚠️ Sinkron dari database Alim belum aktif (`ALIM_MONGO_URI` kosong), jadi Dana Alim hanya dari webhook Pakasir.',
+        '⚠️ Sinkron data Alim nonaktif (`ALIM_FEED_URL=off`), jadi Dana Alim hanya dari webhook Pakasir.',
     };
   }
   let text = docs.length > 1 ? `🔎 *${docs.length} catatan cocok dengan* \`${mdSafe(q)}\`:\n` : '🔎 *Lacak pesanan Alim*\n';
@@ -255,10 +255,10 @@ async function buildDanaAlimView(notice) {
 
   const sync = await alimSync.alimSyncStatus();
   if (!sync.enabled) {
-    text += '\n\n⚠️ Sinkron dari database Alim belum aktif: isi `ALIM_MONGO_URI` di Environment Render supaya order Alim tetap tercatat walau webhook Pakasir tidak sampai.';
+    text += '\n\n⚠️ Sinkron data Alim nonaktif (`ALIM_FEED_URL=off`): order Alim hanya tercatat bila webhook Pakasir sampai.';
   } else if (sync.lastRun) {
     text += sync.lastRun.ok
-      ? `\n\n🔄 Sinkron data Alim: ${wibFmt(sync.lastRun.at)} — ${sync.lastRun.recorded} order baru dicatat`
+      ? `\n\n🔄 Sinkron dari ${sync.sourceLabel}: ${wibFmt(sync.lastRun.at)} — ${sync.lastRun.recorded} order baru dicatat`
       : `\n\n⚠️ Sinkron data Alim gagal (${wibFmt(sync.lastRun.at)}): ${mdPlain(sync.lastRun.error)}`;
   }
   text += `\n📨 Webhook Pakasir terakhir: ${sync.webhookOkAt ? wibFmt(sync.webhookOkAt) : 'belum pernah tercatat'}`;
@@ -1077,8 +1077,8 @@ module.exports = (bot) => {
     await ctx.answerCbQuery('Menyinkronkan…').catch(() => {});
     try {
       const r = await alimSync.syncAlimSales();
-      const notice = !r.enabled ? 'ℹ️ Sinkron belum aktif (`ALIM_MONGO_URI` kosong).'
-        : !r.ok ? '❌ Sinkron gagal. Cek `ALIM_MONGO_URI` & Network Access MongoDB Alim.'
+      const notice = !r.enabled ? 'ℹ️ Sinkron data Alim nonaktif (`ALIM_FEED_URL=off`).'
+        : !r.ok ? `❌ Sinkron gagal: ${mdPlain(r.error)}`
           : r.recorded > 0 ? `✅ Sinkron selesai: *${r.recorded}* order baru dicatat (${rpFmt(r.recordedAmount)}).`
             : '✅ Sinkron selesai: tidak ada order baru.';
       const { text, keyboard } = await buildDanaAlimView(notice);

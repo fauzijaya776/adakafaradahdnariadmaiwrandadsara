@@ -107,6 +107,9 @@ const SettingsSchema = new mongoose.Schema({
     gmailcheck_enabled: { type: Boolean, default: true },
     // Template pesan "bot pindah" (menu Pembeli DO). Kosong = pakai template bawaan.
     move_template: String,
+    // Kapan webhook Pakasir terakhir diterima / ditolak (X-Secret salah). Untuk diagnosa Dana Alim.
+    pakasir_webhook_ok_at: Date,
+    pakasir_webhook_rejected_at: Date,
 });
 
 // =============================================================
@@ -141,6 +144,7 @@ const AlimSaleSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now },
     settled: { type: Boolean, default: false },
     settledAt: Date,
+    via: String,                            // 'webhook' (notifikasi Pakasir) | 'sync' (dari database Alim, lihat alimsync.js)
 });
 AlimSaleSchema.index({ settled: 1, createdAt: -1 });
 

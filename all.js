@@ -25,6 +25,7 @@ const qrin = require('./qris_qrin');
 const pakasir = require('./qris_pakasir');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
+const alimSync = require('./alimsync');
 const QRCode = require('qrcode');
 const docheck = require('./docheck');
 
@@ -999,11 +1000,17 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
         // Lacak ID pesanan (?q=...) — mencari di SEMUA catatan, termasuk yang sudah dibayarkan.
         const q = String(req.query.q || '').trim().toUpperCase().replace(/\s+/g, '').slice(0, 64);
         let found = null;
+        let lookup = null; // hasil cek langsung ke database Alim + Pakasir bila belum tercatat
         if (q) {
             if (!/^[A-Z0-9-]+$/.test(q)) found = [];
             else {
                 const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                found = await AlimSale.find({ orderId: { $regex: esc } }).sort({ createdAt: -1 }).limit(20).lean();
+                const search = () => AlimSale.find({ orderId: { $regex: esc } }).sort({ createdAt: -1 }).limit(20).lean();
+                found = await search();
+                if (found.length === 0 && alimSync.isEnabled()) {
+                    lookup = await alimSync.syncAlimOrder(q);
+                    if (lookup.status === 'recorded' || lookup.status === 'already') found = await search();
+                }
             }
         }
         const srcOf = (id) => (/^WEBALIM-/.test(String(id || '')) ? 'web' : 'tele');
@@ -1022,11 +1029,34 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
             { $limit: 10 },
         ]);
 
+        const sync = await alimSync.alimSyncStatus();
+        const syncView = {
+            enabled: sync.enabled, days: sync.days,
+            last: sync.lastRun ? {
+                when: fmtWIB(sync.lastRun.at), ok: sync.lastRun.ok, error: sync.lastRun.error || '',
+                scanned: sync.lastRun.scanned || 0, recorded: sync.lastRun.recorded || 0,
+                noTxn: sync.lastRun.noTxn || [], rejected: sync.lastRun.rejected || [],
+                pending: sync.lastRun.pending || 0, failed: sync.lastRun.failed || 0, deferred: sync.lastRun.deferred || 0,
+            } : null,
+            webhookOk: sync.webhookOkAt ? fmtWIB(sync.webhookOkAt) : '',
+            webhookRejected: sync.webhookRejectedAt ? fmtWIB(sync.webhookRejectedAt) : '',
+            webhookRejectedNewer: !!(sync.webhookRejectedAt && (!sync.webhookOkAt || new Date(sync.webhookRejectedAt) > new Date(sync.webhookOkAt))),
+        };
+        // Hasil tombol "Sinkronkan sekarang" (?synced=jumlah&sa=nominal / ?syncerr=1)
+        const syncNotice = req.query.syncerr !== undefined ? { error: true }
+            : req.query.synced !== undefined ? { count: parseInt(req.query.synced, 10) || 0, amount: parseInt(req.query.sa, 10) || 0 }
+            : null;
+
         res.render('layout', {
             page: 'dana-alim',
             body: await ejs.renderFile(path.join(__dirname, 'views/dana-alim.ejs'), {
                 total, count, upto, bySrc,
+                sync: syncView, syncNotice,
                 q, found: found ? found.map(view) : null,
+                lookup: lookup && lookup.enabled ? {
+                    found: !!lookup.found, orderId: lookup.orderId, alimStatus: lookup.alimStatus || '',
+                    status: lookup.status || '', reason: lookup.reason || lookup.error || '',
+                } : null,
                 items: items.map(view),
                 history: history.map(h => ({ when: fmtWIB(h._id), total: h.total, count: h.count })),
                 resetCount: req.query.reset !== undefined ? (parseInt(req.query.reset, 10) || 0) : null,
@@ -1037,6 +1067,13 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
         console.error("Dana Alim Page Error:", error);
         res.status(500).send("Error loading Dana Alim page.");
     }
+});
+
+// Tarik sekarang order Alim yang sudah lunas dari database Alim (lihat alimsync.js).
+app.post('/dana-alim/sync', authMiddleware, async (req, res) => {
+    const r = await alimSync.syncAlimSales();
+    if (!r.enabled || !r.ok) return res.redirect('/dana-alim?syncerr=1');
+    res.redirect(`/dana-alim?synced=${r.recorded || 0}&sa=${r.recordedAmount || 0}`);
 });
 
 // Reset ke 0 = tandai catatan sebagai SUDAH DIBAYARKAN (data tetap disimpan sbg riwayat).
@@ -2560,21 +2597,7 @@ async function recordAlimSale(body) {
     }
     if (amount <= 0) return { recorded: false, reason: 'nominal kosong' };
 
-    let completedAt = body.completed_at ? new Date(body.completed_at) : new Date();
-    if (isNaN(completedAt.getTime())) completedAt = new Date();
-
-    const doc = { amount, completedAt, settled: false };
-    if (txnId) doc.txnId = txnId;
-
-    try {
-        const r = await AlimSale.updateOne({ orderId }, { $setOnInsert: doc }, { upsert: true });
-        return r.upsertedCount > 0
-            ? { recorded: true, amount }
-            : { recorded: false, reason: 'sudah tercatat sebelumnya' };
-    } catch (e) {
-        if (e && e.code === 11000) return { recorded: false, reason: 'sudah tercatat sebelumnya' };
-        throw e;
-    }
+    return alimSync.upsertAlimSale({ orderId, txnId, amount, completedAt: body.completed_at, via: 'webhook' });
 }
 
 async function fulfillPakasirPaidOrder(orderId) {
@@ -2928,8 +2951,10 @@ app.post(['/callback', '/qrin/callback', '/pakasir/callback'], async (req, res) 
             const secretHeader = req.headers['x-secret'];
             if (!pakasir.verifyWebhookSecret(secretHeader)) {
                 console.warn('[PAKASIR CALLBACK] X-Secret tidak valid — ditolak.');
+                alimSync.noteWebhook('rejected'); // tampil di halaman Dana Alim (diagnosa)
                 return res.status(401).json({ success: false, message: 'Invalid secret' });
             }
+            alimSync.noteWebhook('ok');
 
             const orderId = body.order_id;
             const txnId = body.txn_id;
@@ -4140,6 +4165,15 @@ if (ADMIN_DEFAULT_LOGIN) {
 }
 // Cek ulang berkala: pembayaran telat / setelah restart tetap diproses.
 setInterval(sweepPakasirOrders, 2 * 60 * 1000);
+
+// Dana Alim: tarik order Alim yang sudah lunas dari database Alim (lapis cadangan bila
+// webhook Pakasir tidak sampai). Hanya jalan bila ALIM_MONGO_URI diisi. Lihat alimsync.js.
+if (alimSync.isEnabled()) {
+    setTimeout(() => alimSync.syncAlimSales(), 45 * 1000);
+    setInterval(() => alimSync.syncAlimSales(), 3 * 60 * 1000);
+} else {
+    console.warn('[DANA ALIM] ALIM_MONGO_URI belum diisi -> Dana Alim hanya dari webhook Pakasir (tanpa sinkron cadangan).');
+}
 
 // Pengecekan akun DigitalOcean di stok: sekali saat start (ditunda 60 detik
 // agar koneksi DB & bot siap), lalu berkala (default tiap 1 jam). Akun yang

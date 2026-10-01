@@ -8,6 +8,7 @@ const {
 } = require('./db');
 const mongoose = require('mongoose');
 const moment = require('moment-timezone');
+const alimSync = require('./alimsync');
 const {
   createTransfer,
   getProfile
@@ -142,6 +143,8 @@ async function alimSourceTotals(match) {
 
 // Isi di dalam `kode` Markdown Telegram: cukup buang backtick supaya format tidak rusak.
 const mdSafe = (s) => String(s == null ? '' : s).replace(/`/g, "'");
+// Teks bebas di luar `kode` (mis. pesan error): buang karakter yang membuka format Markdown.
+const mdPlain = (s) => String(s == null ? '' : s).replace(/[`*_\[]/g, ' ');
 
 // Lacak satu ID pesanan Alim (Telegram / Website). Mengembalikan teks Markdown.
 async function buildAlimTrackText(rawInput) {
@@ -155,11 +158,27 @@ async function buildAlimTrackText(rawInput) {
     const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     docs = await AlimSale.find({ orderId: { $regex: esc } }).sort({ createdAt: -1 }).limit(5).lean();
   }
+  if (!docs.length && alimSync.isEnabled()) {
+    // Belum tercatat -> cek langsung ke database Alim + Pakasir; bila sudah lunas langsung dicatat.
+    const lookup = await alimSync.syncAlimOrder(q);
+    if (lookup.status === 'recorded' || lookup.status === 'already') {
+      docs = await AlimSale.find({ orderId: lookup.orderId }).lean();
+    } else {
+      const info = lookup.found
+        ? `Di database Alim: status \`${mdSafe(lookup.alimStatus || '-')}\`.` + (lookup.reason ? `\nCek Pakasir: ${mdPlain(lookup.reason)}.` : '')
+        : 'ID ini juga *tidak ditemukan* di database Alim' + (lookup.reason || lookup.error ? ` (${mdPlain(lookup.reason || lookup.error)})` : '') + '. Pastikan ID tidak salah ketik.';
+      return {
+        found: false,
+        text: `🔎 *Lacak pesanan Alim*\n\nID \`${mdSafe(q)}\` *tidak ada di catatan Dana Alim*.\n\n${info}`,
+      };
+    }
+  }
   if (!docs.length) {
     return {
       found: false,
       text: `🔎 *Lacak pesanan Alim*\n\nID \`${mdSafe(q)}\` *tidak ada di catatan Dana Alim*.\n\n` +
-        'Kemungkinan:\n• pesanan belum dibayar / dibatalkan,\n• notifikasi Pakasir belum masuk (tunggu sebentar),\n• ID salah ketik.',
+        'Kemungkinan:\n• pesanan belum dibayar / dibatalkan,\n• notifikasi Pakasir belum masuk (tunggu sebentar),\n• ID salah ketik.\n\n' +
+        '⚠️ Sinkron dari database Alim belum aktif (`ALIM_MONGO_URI` kosong), jadi Dana Alim hanya dari webhook Pakasir.',
     };
   }
   let text = docs.length > 1 ? `🔎 *${docs.length} catatan cocok dengan* \`${mdSafe(q)}\`:\n` : '🔎 *Lacak pesanan Alim*\n';
@@ -233,12 +252,26 @@ async function buildDanaAlimView(notice) {
     text += '\nBelum ada catatan.\n';
   }
   if (last) text += `\nReset terakhir: ${wibFmt(last._id)} — ${rpFmt(last.total)} (${last.count} order)`;
+
+  const sync = await alimSync.alimSyncStatus();
+  if (!sync.enabled) {
+    text += '\n\n⚠️ Sinkron dari database Alim belum aktif: isi `ALIM_MONGO_URI` di Environment Render supaya order Alim tetap tercatat walau webhook Pakasir tidak sampai.';
+  } else if (sync.lastRun) {
+    text += sync.lastRun.ok
+      ? `\n\n🔄 Sinkron data Alim: ${wibFmt(sync.lastRun.at)} — ${sync.lastRun.recorded} order baru dicatat`
+      : `\n\n⚠️ Sinkron data Alim gagal (${wibFmt(sync.lastRun.at)}): ${mdPlain(sync.lastRun.error)}`;
+  }
+  text += `\n📨 Webhook Pakasir terakhir: ${sync.webhookOkAt ? wibFmt(sync.webhookOkAt) : 'belum pernah tercatat'}`;
+  if (sync.webhookRejectedAt && (!sync.webhookOkAt || sync.webhookRejectedAt > sync.webhookOkAt)) {
+    text += `\n❗ Webhook DITOLAK (X-Secret salah) terakhir: ${wibFmt(sync.webhookRejectedAt)}`;
+  }
   text += '\n\n_Hanya catatan, tidak memengaruhi saldo Pakasir._';
 
   const rows = [];
   // latestMs ikut di tombol: yang di-reset hanya order yang TAMPIL di layar ini.
   if (count > 0) rows.push([Markup.button.callback('🔄 Reset ke 0 (sudah dibayar)', `dar_ask:${latestMs}`)]);
   rows.push([Markup.button.callback('🔎 Lacak ID pesanan', 'dal_track')]);
+  if (sync.enabled) rows.push([Markup.button.callback('🔄 Sinkronkan dari data Alim', 'dal_sync')]);
   rows.push([Markup.button.callback('♻️ Muat ulang', 'admin_dana_alim')]);
   rows.push([Markup.button.callback('⬅️ Kembali', 'admin_menu')]);
   return { text, keyboard: Markup.inlineKeyboard(rows) };
@@ -1036,6 +1069,23 @@ module.exports = (bot) => {
     } catch (err) {
       console.error('[DANA ALIM] view error:', err);
       ctx.reply('❌ Gagal memuat Dana Alim.');
+    }
+  });
+
+  // Tarik sekarang order Alim yang sudah lunas dari database Alim (lihat alimsync.js).
+  bot.action('dal_sync', adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery('Menyinkronkan…').catch(() => {});
+    try {
+      const r = await alimSync.syncAlimSales();
+      const notice = !r.enabled ? 'ℹ️ Sinkron belum aktif (`ALIM_MONGO_URI` kosong).'
+        : !r.ok ? '❌ Sinkron gagal. Cek `ALIM_MONGO_URI` & Network Access MongoDB Alim.'
+          : r.recorded > 0 ? `✅ Sinkron selesai: *${r.recorded}* order baru dicatat (${rpFmt(r.recordedAmount)}).`
+            : '✅ Sinkron selesai: tidak ada order baru.';
+      const { text, keyboard } = await buildDanaAlimView(notice);
+      await safeEditOrReply(ctx, text, keyboard);
+    } catch (err) {
+      console.error('[DANA ALIM] sync error:', err);
+      ctx.reply('❌ Gagal sinkron Dana Alim.');
     }
   });
 

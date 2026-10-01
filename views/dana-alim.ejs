@@ -9,6 +9,20 @@
             Tidak ada catatan yang di-reset (sudah 0 atau sudah di-reset sebelumnya).
         </div>
     <% } %>
+    <% if (syncNotice && syncNotice.error) { %>
+        <div class="mb-6 text-sm rounded-lg px-4 py-3 bg-red-50 text-red-700 border border-red-100">
+            Sinkronisasi gagal. Lihat detail di kotak "Sinkronisasi data Alim" di bawah.
+        </div>
+    <% } else if (syncNotice) { %>
+        <div class="mb-6 text-sm rounded-lg px-4 py-3 <%= syncNotice.count > 0 ? 'bg-green-50 text-green-700 border-green-100' : 'bg-gray-50 text-gray-600 border-gray-100' %> border">
+            <% if (syncNotice.count > 0) { %>
+                Sinkronisasi selesai: <b><%= syncNotice.count %></b> order baru dicatat senilai
+                <b>Rp <%= Number(syncNotice.amount || 0).toLocaleString('id-ID') %></b>.
+            <% } else { %>
+                Sinkronisasi selesai: tidak ada order baru (semua order Alim yang lunas sudah tercatat).
+            <% } %>
+        </div>
+    <% } %>
 
     <div class="bg-white rounded-xl shadow p-6 mb-6">
         <h2 class="text-lg font-bold text-gray-800 mb-1">Dana tokotelealim (Alim Store)</h2>
@@ -51,6 +65,54 @@
     </div>
 
     <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h3 class="text-sm font-semibold text-gray-700 mb-3">Sinkronisasi data Alim</h3>
+        <% if (!sync.enabled) { %>
+            <div class="text-sm rounded-lg px-4 py-3 bg-yellow-50 text-yellow-800 border border-yellow-100 mb-3">
+                <b>Belum aktif.</b> Saat ini Dana Alim hanya terisi dari webhook Pakasir. Kalau webhook tidak sampai ke bot ini,
+                order Alim tidak tercatat walaupun di dashboard Pakasir sudah <i>completed</i>.<br>
+                Supaya semua order Alim (bot Telegram &amp; website) selalu tercatat, isi
+                <code class="text-xs bg-yellow-100 px-1 rounded">ALIM_MONGO_URI</code> di Environment Render
+                (salin <code class="text-xs bg-yellow-100 px-1 rounded">MONGO_URI</code> dari bot tokotelealim / website Alim), lalu deploy ulang.
+            </div>
+        <% } else { %>
+            <p class="text-sm text-gray-500 mb-3">
+                Tiap 3 menit bot membaca order Alim yang sudah lunas (<%= sync.days %> hari terakhir) dari database Alim,
+                mengecek ulang ke Pakasir, lalu mencatat yang belum tercatat. Tidak bergantung pada webhook.
+            </p>
+            <% if (sync.last) { %>
+                <% if (!sync.last.ok) { %>
+                    <div class="text-sm rounded-lg px-4 py-3 bg-red-50 text-red-700 border border-red-100 mb-3">
+                        Sinkron terakhir (<%= sync.last.when %>) gagal: <span class="font-mono text-xs"><%= sync.last.error %></span><br>
+                        Cek <code class="text-xs">ALIM_MONGO_URI</code> dan Network Access MongoDB Atlas milik Alim (izinkan IP Render / 0.0.0.0/0).
+                    </div>
+                <% } else { %>
+                    <p class="text-sm text-gray-600 mb-2">
+                        Sinkron terakhir: <b><%= sync.last.when %></b> WIB — <%= sync.last.scanned %> order lunas dibaca,
+                        <b><%= sync.last.recorded %></b> baru dicatat<% if (sync.last.pending) { %>, <%= sync.last.pending %> masih pending di Pakasir<% } %><% if (sync.last.failed) { %>, <%= sync.last.failed %> gagal dicek (dicoba lagi)<% } %><% if (sync.last.deferred) { %>, <%= sync.last.deferred %> menunggu putaran berikut<% } %>.
+                    </p>
+                    <% if (sync.last.noTxn.length) { %>
+                        <p class="text-xs text-amber-700 mb-1">Tidak bisa diverifikasi (tanpa txn_id Pakasir): <span class="font-mono"><%= sync.last.noTxn.slice(0, 10).join(', ') %></span></p>
+                    <% } %>
+                    <% if (sync.last.rejected.length) { %>
+                        <p class="text-xs text-gray-500 mb-1">Ditolak saat cek Pakasir: <span class="font-mono"><%= sync.last.rejected.slice(0, 10).join(', ') %></span></p>
+                    <% } %>
+                <% } %>
+            <% } else { %>
+                <p class="text-sm text-gray-400 mb-2">Belum pernah sinkron sejak bot menyala.</p>
+            <% } %>
+            <form method="POST" action="/dana-alim/sync" class="mt-3">
+                <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg text-sm">Sinkronkan sekarang</button>
+            </form>
+        <% } %>
+        <div class="text-xs text-gray-500 mt-4 border-t pt-3">
+            Webhook Pakasir terakhir diterima: <b><%= sync.webhookOk || 'belum pernah tercatat' %></b><% if (sync.webhookOk) { %> WIB<% } %>
+            <% if (sync.webhookRejected) { %>
+                <br><span class="<%= sync.webhookRejectedNewer ? 'text-red-600' : '' %>">Webhook ditolak (X-Secret tidak cocok) terakhir: <b><%= sync.webhookRejected %></b> WIB<% if (sync.webhookRejectedNewer) { %> — samakan <code>PAKASIR_WEBHOOK_SECRET</code> di Render dengan Secret di detail project Pakasir.<% } %></span>
+            <% } %>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
         <h3 class="text-sm font-semibold text-gray-700 mb-3">Lacak ID pesanan</h3>
         <form method="GET" action="/dana-alim" class="flex flex-wrap gap-2 mb-2">
             <input type="text" name="q" value="<%= q %>" maxlength="64" autocomplete="off"
@@ -63,8 +125,15 @@
         <% if (found !== null) { %>
             <% if (found.length === 0) { %>
                 <div class="text-sm rounded-lg px-4 py-3 bg-yellow-50 text-yellow-800 border border-yellow-100">
-                    ID <b class="font-mono"><%= q %></b> tidak ada di catatan Dana Alim. Kemungkinan pesanan belum dibayar / dibatalkan,
-                    notifikasi Pakasir belum masuk, atau ID salah ketik.
+                    ID <b class="font-mono"><%= q %></b> tidak ada di catatan Dana Alim.
+                    <% if (lookup && lookup.found) { %>
+                        <br>Di database Alim: status <b><%= lookup.alimStatus || '-' %></b>.
+                        <% if (lookup.reason) { %>Hasil cek Pakasir: <%= lookup.reason %>.<% } %>
+                    <% } else if (lookup) { %>
+                        <br>ID ini juga tidak ditemukan di database Alim<% if (lookup.reason) { %> (<%= lookup.reason %>)<% } %>. Pastikan ID tidak salah ketik.
+                    <% } else { %>
+                        Kemungkinan pesanan belum dibayar / dibatalkan, notifikasi Pakasir belum masuk, atau ID salah ketik.
+                    <% } %>
                 </div>
             <% } else { %>
                 <div class="overflow-x-auto">

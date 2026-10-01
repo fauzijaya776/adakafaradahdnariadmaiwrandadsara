@@ -118,10 +118,85 @@ async function getAdminMenuMessageAndKeyboard() {
 }
 
 // ================= DANA ALIM (catatan dana order tokotelealim) =================
-// Total order ALIM- yang masuk ke akun Pakasir bersama dan belum dibayarkan ke
+// Total order Alim Store yang masuk ke akun Pakasir bersama dan belum dibayarkan ke
 // pemilik tokotelealim. Hanya CATATAN — tidak memengaruhi saldo Pakasir.
+// Sumber dibedakan dari awalan ID pesanan:
+//   ALIM-<idTelegram>-<waktu>  = penjualan bot Telegram @cloudalimbot
+//   WEBALIM-XXXXXXXXXX         = penjualan website Alim Store (alimcloud.id)
 const rpFmt = (n) => 'Rp ' + Number(n || 0).toLocaleString('id-ID');
 const wibFmt = (d) => (d ? moment(d).tz('Asia/Jakarta').format('DD/MM HH:mm') : '-');
+const alimSourceOf = (orderId) => (/^WEBALIM-/.test(String(orderId || '')) ? 'web' : 'tele');
+const ALIM_SOURCE_LABEL = { tele: '📱 Telegram', web: '🌐 Website' };
+// Ekspresi agregasi: 'web' bila orderId diawali WEBALIM-, selain itu 'tele'.
+const ALIM_SOURCE_EXPR = { $cond: [{ $eq: [{ $indexOfCP: [{ $ifNull: ['$orderId', ''] }, 'WEBALIM-'] }, 0] }, 'web', 'tele'] };
+
+async function alimSourceTotals(match) {
+  const rows = await AlimSale.aggregate([
+    { $match: match },
+    { $group: { _id: ALIM_SOURCE_EXPR, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+  ]);
+  const out = { tele: { total: 0, count: 0 }, web: { total: 0, count: 0 } };
+  rows.forEach((r) => { if (out[r._id]) out[r._id] = { total: r.total, count: r.count }; });
+  return out;
+}
+
+// Isi di dalam `kode` Markdown Telegram: cukup buang backtick supaya format tidak rusak.
+const mdSafe = (s) => String(s == null ? '' : s).replace(/`/g, "'");
+
+// Lacak satu ID pesanan Alim (Telegram / Website). Mengembalikan teks Markdown.
+async function buildAlimTrackText(rawInput) {
+  const q = String(rawInput || '').trim().toUpperCase().replace(/\s+/g, '');
+  if (!q || q.length < 4 || q.length > 64 || !/^[A-Z0-9-]+$/.test(q)) {
+    return { found: false, text: '❌ Format ID tidak dikenali.\n\nContoh: `WEBALIM-K7Q2M9XA4D` atau `ALIM-123456789-1759300000000`' };
+  }
+  let docs = await AlimSale.find({ orderId: q }).lean();
+  if (!docs.length) {
+    // boleh ketik sebagian ID (mis. 10 karakter terakhir pesanan web)
+    const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    docs = await AlimSale.find({ orderId: { $regex: esc } }).sort({ createdAt: -1 }).limit(5).lean();
+  }
+  if (!docs.length) {
+    return {
+      found: false,
+      text: `🔎 *Lacak pesanan Alim*\n\nID \`${mdSafe(q)}\` *tidak ada di catatan Dana Alim*.\n\n` +
+        'Kemungkinan:\n• pesanan belum dibayar / dibatalkan,\n• notifikasi Pakasir belum masuk (tunggu sebentar),\n• ID salah ketik.',
+    };
+  }
+  let text = docs.length > 1 ? `🔎 *${docs.length} catatan cocok dengan* \`${mdSafe(q)}\`:\n` : '🔎 *Lacak pesanan Alim*\n';
+  docs.forEach((d) => {
+    const src = alimSourceOf(d.orderId);
+    text += `\n🆔 \`${mdSafe(d.orderId)}\`\n` +
+      `Sumber: *${ALIM_SOURCE_LABEL[src]}*\n`;
+    if (src === 'tele') {
+      const m = String(d.orderId).match(/^ALIM-(\d+)-/);
+      if (m) text += `Pembeli (ID Telegram): \`${m[1]}\`\n`;
+    }
+    text += `Nominal: *${rpFmt(d.amount)}*\n` +
+      `Dibayar: ${wibFmt(d.completedAt || d.createdAt)} WIB\n` +
+      (d.txnId ? `Txn Pakasir: \`${mdSafe(d.txnId)}\`\n` : '') +
+      (d.settled ? `Status: ✅ *Sudah dibayarkan* ke Alim (reset ${wibFmt(d.settledAt)})\n` : 'Status: ⏳ *Belum dibayarkan* ke Alim\n');
+  });
+  return { found: true, text };
+}
+
+// Dipanggil dari handler teks (all.js) saat admin sedang di mode "Lacak ID".
+async function handleAlimTrackInput(ctx) {
+  if (!ADMIN_IDS.includes(String(ctx.from.id))) return true;
+  try {
+    const { text } = await buildAlimTrackText(ctx.message.text);
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('🔎 Lacak ID lain', 'dal_track')],
+        [Markup.button.callback('⬅️ Kembali ke Dana Alim', 'admin_dana_alim')],
+      ]).reply_markup,
+    });
+  } catch (err) {
+    console.error('[DANA ALIM] track error:', err);
+    await ctx.reply('❌ Gagal melacak ID pesanan.').catch(() => {});
+  }
+  return true;
+}
 
 async function buildDanaAlimView(notice) {
   const [agg] = await AlimSale.aggregate([
@@ -140,14 +215,19 @@ async function buildDanaAlimView(notice) {
     { $limit: 1 },
   ]);
 
+  const bySrc = await alimSourceTotals({ settled: false });
+
   let text = notice ? `${notice}\n\n` : '';
-  text += '💵 *Dana tokotelealim (Alim Store)*\n\n' +
+  text += '💵 *Dana tokotelealim (Alim Store)*\n_Gabungan penjualan bot Telegram + website_\n\n' +
     `Belum dibayarkan: *${rpFmt(total)}*\n` +
-    `Jumlah order: *${count}*\n`;
+    `Jumlah order: *${count}*\n` +
+    `├ ${ALIM_SOURCE_LABEL.tele}: ${rpFmt(bySrc.tele.total)} (${bySrc.tele.count} order)\n` +
+    `└ ${ALIM_SOURCE_LABEL.web}: ${rpFmt(bySrc.web.total)} (${bySrc.web.count} order)\n`;
   if (recent.length > 0) {
     text += `\n*${count > recent.length ? `10 order terbaru dari ${count}` : 'Daftar order'}:*\n`;
     recent.forEach((r) => {
-      text += `• ${wibFmt(r.completedAt || r.createdAt)} — ${rpFmt(r.amount)}\n   \`${r.orderId}\`\n`;
+      const icon = alimSourceOf(r.orderId) === 'web' ? '🌐' : '📱';
+      text += `${icon} ${wibFmt(r.completedAt || r.createdAt)} — ${rpFmt(r.amount)}\n   \`${r.orderId}\`\n`;
     });
   } else {
     text += '\nBelum ada catatan.\n';
@@ -158,6 +238,7 @@ async function buildDanaAlimView(notice) {
   const rows = [];
   // latestMs ikut di tombol: yang di-reset hanya order yang TAMPIL di layar ini.
   if (count > 0) rows.push([Markup.button.callback('🔄 Reset ke 0 (sudah dibayar)', `dar_ask:${latestMs}`)]);
+  rows.push([Markup.button.callback('🔎 Lacak ID pesanan', 'dal_track')]);
   rows.push([Markup.button.callback('♻️ Muat ulang', 'admin_dana_alim')]);
   rows.push([Markup.button.callback('⬅️ Kembali', 'admin_menu')]);
   return { text, keyboard: Markup.inlineKeyboard(rows) };
@@ -955,6 +1036,29 @@ module.exports = (bot) => {
     } catch (err) {
       console.error('[DANA ALIM] view error:', err);
       ctx.reply('❌ Gagal memuat Dana Alim.');
+    }
+  });
+
+  // Lacak ID pesanan Alim (Telegram ALIM-… / Website WEBALIM-…)
+  bot.action('dal_track', adminMiddleware, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    userStates[ctx.from.id] = { state: 'awaiting_alim_track' };
+    const text = '🔎 *Lacak ID pesanan Alim*\n\nKirim ID pesanannya, misalnya:\n' +
+      '• `WEBALIM-K7Q2M9XA4D` (website)\n• `ALIM-123456789-1759300000000` (bot Telegram)\n\n' +
+      '_Boleh sebagian ID, mis. 10 karakter terakhir pesanan web._';
+    await safeEditOrReply(ctx, text, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Batal', 'admin_dana_alim')]]));
+  });
+
+  // Pintasan: /lacakalim WEBALIM-XXXXXXXXXX
+  bot.command('lacakalim', adminMiddleware, async (ctx) => {
+    const arg = String(ctx.message.text || '').split(/\s+/).slice(1).join('');
+    if (!arg) return ctx.reply('Contoh: /lacakalim WEBALIM-K7Q2M9XA4D');
+    try {
+      const { text } = await buildAlimTrackText(arg);
+      await ctx.reply(text, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('[DANA ALIM] track error:', err);
+      ctx.reply('❌ Gagal melacak ID pesanan.');
     }
   });
 
@@ -1886,3 +1990,6 @@ module.exports.handleTakeStockCount = handleTakeStockCount;
 module.exports.handleVariantPriceInput = handleVariantPriceInput;
 module.exports.handleVariantNameInput = handleVariantNameInput;
 module.exports.takeStockAtomic = takeStockAtomic;
+module.exports.handleAlimTrackInput = handleAlimTrackInput;
+module.exports.buildAlimTrackText = buildAlimTrackText;
+module.exports.alimSourceTotals = alimSourceTotals;

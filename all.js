@@ -978,8 +978,8 @@ app.post('/statusdo/run', authMiddleware, async (req, res) => {
     }
 });
 
-// --- Dana Alim (admin panel): CATATAN total order tokotelealim (ALIM-) yang masuk ---
-// ke akun Pakasir bersama, untuk tahu berapa yang harus dibayarkan saat pencairan.
+// --- Dana Alim (admin panel): CATATAN total order Alim Store yang masuk ke akun Pakasir ---
+// bersama (bot Telegram ALIM- + website WEBALIM-), untuk tahu berapa yang harus dibayarkan.
 function fmtWIB(d) {
     return d ? moment(d).tz('Asia/Jakarta').format('DD/MM/YY HH:mm') : '-';
 }
@@ -993,6 +993,26 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
         const total = agg ? agg.total : 0;
         const count = agg ? agg.count : 0;
         const upto = agg && agg.latest ? new Date(agg.latest).toISOString() : '';
+        // Rincian per sumber: bot Telegram (ALIM-…) dan website (WEBALIM-…)
+        const bySrc = await adminModule.alimSourceTotals({ settled: false });
+
+        // Lacak ID pesanan (?q=...) — mencari di SEMUA catatan, termasuk yang sudah dibayarkan.
+        const q = String(req.query.q || '').trim().toUpperCase().replace(/\s+/g, '').slice(0, 64);
+        let found = null;
+        if (q) {
+            if (!/^[A-Z0-9-]+$/.test(q)) found = [];
+            else {
+                const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                found = await AlimSale.find({ orderId: { $regex: esc } }).sort({ createdAt: -1 }).limit(20).lean();
+            }
+        }
+        const srcOf = (id) => (/^WEBALIM-/.test(String(id || '')) ? 'web' : 'tele');
+        const buyerOf = (id) => { const m = String(id || '').match(/^ALIM-(\d+)-/); return m ? m[1] : ''; };
+        const view = (i) => ({
+            orderId: i.orderId, amount: i.amount, when: fmtWIB(i.completedAt || i.createdAt),
+            source: srcOf(i.orderId), buyer: buyerOf(i.orderId), txnId: i.txnId || '',
+            settled: !!i.settled, settledAt: i.settled ? fmtWIB(i.settledAt) : '',
+        });
 
         const items = await AlimSale.find({ settled: false }).sort({ createdAt: -1 }).limit(100).lean();
         const history = await AlimSale.aggregate([
@@ -1005,8 +1025,9 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
         res.render('layout', {
             page: 'dana-alim',
             body: await ejs.renderFile(path.join(__dirname, 'views/dana-alim.ejs'), {
-                total, count, upto,
-                items: items.map(i => ({ orderId: i.orderId, amount: i.amount, when: fmtWIB(i.completedAt || i.createdAt) })),
+                total, count, upto, bySrc,
+                q, found: found ? found.map(view) : null,
+                items: items.map(view),
                 history: history.map(h => ({ when: fmtWIB(h._id), total: h.total, count: h.count })),
                 resetCount: req.query.reset !== undefined ? (parseInt(req.query.reset, 10) || 0) : null,
                 resetTotal: req.query.rt !== undefined ? (parseInt(req.query.rt, 10) || 0) : null,
@@ -2920,7 +2941,32 @@ app.post(['/callback', '/qrin/callback', '/pakasir/callback'], async (req, res) 
             // Pakasir yang sama). tokotelealim mengonfirmasi & mengirim akun sendiri via
             // polling, jadi bot ini TIDAK memproses order-nya — hanya MENCATAT nominalnya
             // (halaman admin "Dana Alim") untuk tahu berapa yang harus dibayarkan.
-            if (String(orderId).startsWith('ALIM-')) {
+            // PENANDA: order ber-prefix W- adalah milik WEBSITE FZI STORE (database & akun Pakasir
+            // yang sama). Bot TIDAK memproses order ini — webhook diteruskan ke website
+            // (WEB_WEBHOOK_URL, mis. https://fzistore.my.id/api/pakasir/webhook) yang
+            // memverifikasi ulang ke Pakasir lalu menampilkan akun di link pembeli.
+            if (String(orderId).startsWith('W-')) {
+                const webHook = process.env.WEB_WEBHOOK_URL;
+                if (!webHook) {
+                    console.log(`[PAKASIR CALLBACK] order web ${orderId} (status=${status}) — WEB_WEBHOOK_URL belum diisi, diabaikan (website tetap mengecek sendiri).`);
+                    return res.json({ success: true, web: true });
+                }
+                try {
+                    await axios.post(webHook, body, {
+                        headers: { 'Content-Type': 'application/json', 'X-Secret': process.env.PAKASIR_WEBHOOK_SECRET || '' },
+                        timeout: 15000,
+                    });
+                    return res.json({ success: true, web: true });
+                } catch (fwdErr) {
+                    console.error(`[PAKASIR CALLBACK] gagal meneruskan order web ${orderId}:`, fwdErr.response ? fwdErr.response.status : fwdErr.message);
+                    // 503 -> Pakasir boleh kirim ulang; website juga punya cek berkala sendiri.
+                    return res.status(503).json({ success: false, message: 'forward later' });
+                }
+            }
+
+            // WEBALIM- = order WEBSITE ALIM STORE (cek lunas sendiri lewat polling) -> dicatat
+            // sebagai Dana Alim juga, sama seperti order bot tokotelealim.
+            if (String(orderId).startsWith('ALIM-') || String(orderId).startsWith('WEBALIM-')) {
                 // is_sandbox bisa datang sebagai boolean (JSON) atau string (form-urlencoded).
                 const isSandbox = body.is_sandbox === true || String(body.is_sandbox).toLowerCase() === 'true';
                 if (status === 'completed' && !isSandbox) {
@@ -3348,6 +3394,12 @@ bot.hears(/^[^\/]/, async (ctx) => {
             delete userStates[userId];
             const { message, keyboard } = await generateQuantityMessageAndKeyboard(productId, variantSlug, qty, page);
             await ctx.reply(message, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            return;
+
+        } else if (userState.state === 'awaiting_alim_track') {
+            // Admin melacak ID pesanan Alim (Dana Alim -> Lacak ID pesanan).
+            const done = await adminModule.handleAlimTrackInput(ctx);
+            if (done) delete userStates[userId];
             return;
 
         } else if (userState.state === 'awaiting_variant_price') {

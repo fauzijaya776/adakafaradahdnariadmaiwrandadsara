@@ -13,8 +13,9 @@
     <div class="bg-white rounded-xl shadow p-6 mb-6">
         <h2 class="text-lg font-bold text-gray-800 mb-1">Dana tokotelealim (Alim Store)</h2>
         <p class="text-sm text-gray-500 mb-5">
-            Catatan total order tokotelealim (ID berawalan <code class="text-xs bg-gray-100 px-1 rounded">ALIM-</code>)
-            yang sudah dibayar dan masuk ke akun Pakasir bersama. Dipakai untuk tahu berapa yang harus
+            Gabungan penjualan Alim Store yang sudah dibayar dan masuk ke akun Pakasir bersama:
+            bot Telegram (ID <code class="text-xs bg-gray-100 px-1 rounded">ALIM-</code>) dan website
+            (ID <code class="text-xs bg-gray-100 px-1 rounded">WEBALIM-</code>). Dipakai untuk tahu berapa yang harus
             dibayarkan saat pencairan. Hanya catatan — tidak memengaruhi saldo Pakasir.
         </p>
 
@@ -26,6 +27,16 @@
             <div class="rounded-lg border border-gray-100 p-5">
                 <div class="text-xs text-gray-500 mb-1">Jumlah order tercatat</div>
                 <div class="text-3xl font-bold text-gray-800"><%= count %></div>
+            </div>
+            <div class="rounded-lg border border-sky-100 bg-sky-50 p-4">
+                <div class="text-xs text-sky-700 mb-1">📱 Dari bot Telegram (ALIM-)</div>
+                <div class="text-xl font-bold text-sky-900">Rp <%= Number(bySrc.tele.total).toLocaleString('id-ID') %></div>
+                <div class="text-xs text-sky-700"><%= bySrc.tele.count %> order</div>
+            </div>
+            <div class="rounded-lg border border-amber-100 bg-amber-50 p-4">
+                <div class="text-xs text-amber-700 mb-1">🌐 Dari website (WEBALIM-)</div>
+                <div class="text-xl font-bold text-amber-900">Rp <%= Number(bySrc.web.total).toLocaleString('id-ID') %></div>
+                <div class="text-xs text-amber-700"><%= bySrc.web.count %> order</div>
             </div>
         </div>
 
@@ -40,6 +51,53 @@
     </div>
 
     <div class="bg-white rounded-xl shadow p-6 mb-6">
+        <h3 class="text-sm font-semibold text-gray-700 mb-3">Lacak ID pesanan</h3>
+        <form method="GET" action="/dana-alim" class="flex flex-wrap gap-2 mb-2">
+            <input type="text" name="q" value="<%= q %>" maxlength="64" autocomplete="off"
+                   placeholder="WEBALIM-K7Q2M9XA4D atau ALIM-123456789-1759300000000"
+                   class="flex-1 min-w-[220px] border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono">
+            <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg text-sm">Lacak</button>
+            <% if (q) { %><a href="/dana-alim" class="py-2 px-3 text-sm text-gray-500 hover:text-gray-700">Hapus</a><% } %>
+        </form>
+        <p class="text-xs text-gray-400 mb-3">Boleh sebagian ID. Mencari di semua catatan, termasuk yang sudah dibayarkan.</p>
+        <% if (found !== null) { %>
+            <% if (found.length === 0) { %>
+                <div class="text-sm rounded-lg px-4 py-3 bg-yellow-50 text-yellow-800 border border-yellow-100">
+                    ID <b class="font-mono"><%= q %></b> tidak ada di catatan Dana Alim. Kemungkinan pesanan belum dibayar / dibatalkan,
+                    notifikasi Pakasir belum masuk, atau ID salah ketik.
+                </div>
+            <% } else { %>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-gray-500 border-b">
+                                <th class="py-2 pr-4 font-medium">ID Order</th>
+                                <th class="py-2 pr-4 font-medium">Sumber</th>
+                                <th class="py-2 pr-4 font-medium">Dibayar (WIB)</th>
+                                <th class="py-2 pr-4 font-medium">Status</th>
+                                <th class="py-2 font-medium text-right">Nominal</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <% found.forEach(function (it) { %>
+                                <tr class="border-b last:border-0 align-top">
+                                    <td class="py-2 pr-4 font-mono text-xs text-gray-700"><%= it.orderId %>
+                                        <% if (it.txnId) { %><div class="text-gray-400">txn <%= it.txnId %></div><% } %></td>
+                                    <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.source === 'web' ? '🌐 Website' : '📱 Telegram' %>
+                                        <% if (it.buyer) { %><div class="text-xs text-gray-400">ID TG <%= it.buyer %></div><% } %></td>
+                                    <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.when %></td>
+                                    <td class="py-2 pr-4 whitespace-nowrap"><% if (it.settled) { %><span class="text-green-700">✅ Sudah dibayarkan</span><div class="text-xs text-gray-400">reset <%= it.settledAt %></div><% } else { %><span class="text-amber-700">⏳ Belum dibayarkan</span><% } %></td>
+                                    <td class="py-2 text-right text-gray-800">Rp <%= Number(it.amount).toLocaleString('id-ID') %></td>
+                                </tr>
+                            <% }) %>
+                        </tbody>
+                    </table>
+                </div>
+            <% } %>
+        <% } %>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 mb-6">
         <h3 class="text-sm font-semibold text-gray-700 mb-4">Order belum dibayarkan<% if (count > items.length) { %> (100 terbaru dari <%= count %>)<% } %></h3>
         <% if (items.length === 0) { %>
             <p class="text-sm text-gray-400">Belum ada catatan.</p>
@@ -50,6 +108,7 @@
                         <tr class="text-left text-gray-500 border-b">
                             <th class="py-2 pr-4 font-medium">Waktu (WIB)</th>
                             <th class="py-2 pr-4 font-medium">ID Order</th>
+                            <th class="py-2 pr-4 font-medium">Sumber</th>
                             <th class="py-2 font-medium text-right">Nominal</th>
                         </tr>
                     </thead>
@@ -57,7 +116,8 @@
                         <% items.forEach(function (it) { %>
                             <tr class="border-b last:border-0">
                                 <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.when %></td>
-                                <td class="py-2 pr-4 font-mono text-xs text-gray-700"><%= it.orderId %></td>
+                                <td class="py-2 pr-4 font-mono text-xs text-gray-700"><a class="hover:underline" href="/dana-alim?q=<%= encodeURIComponent(it.orderId) %>"><%= it.orderId %></a></td>
+                                <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.source === 'web' ? '🌐 Website' : '📱 Telegram' %></td>
                                 <td class="py-2 text-right text-gray-800">Rp <%= Number(it.amount).toLocaleString('id-ID') %></td>
                             </tr>
                         <% }) %>

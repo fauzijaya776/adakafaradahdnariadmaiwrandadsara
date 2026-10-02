@@ -22,6 +22,7 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const moment = require('moment-timezone');
 const pakasir = require('./qris_pakasir');
 const { AlimSale, Settings } = require('./db');
 
@@ -133,8 +134,19 @@ function sourceOf(orderId) {
 
 // ---------------- simpan catatan (dipakai webhook & sinkron) ----------------
 // Idempoten: orderId unik, jadi webhook yang dikirim ulang / sinkron berulang tidak menghitung dobel.
+// completed_at Pakasir biasanya ISO lengkap dengan zona (…+07:00). Kalau datang TANPA zona,
+// anggap WIB — bukan zona server (Render = UTC) — supaya tanggal bayar, dan jadwal cair
+// Dana Alim (lihat alimcair.js), tidak bergeser 7 jam.
+function parsePaidAt(v) {
+    if (v instanceof Date) return new Date(v.getTime());
+    if (typeof v === 'number') return new Date(v);
+    const s = String(v).trim();
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) return moment.tz(s, 'Asia/Jakarta').toDate();
+    return new Date(s);
+}
+
 async function upsertAlimSale({ orderId, txnId, amount, completedAt, via }) {
-    let when = completedAt ? new Date(completedAt) : new Date();
+    let when = completedAt ? parsePaidAt(completedAt) : new Date();
     if (isNaN(when.getTime())) when = new Date();
     const doc = { amount, completedAt: when, settled: false, via };
     if (txnId) doc.txnId = String(txnId);
@@ -317,6 +329,7 @@ async function alimSyncStatus() {
 }
 
 module.exports = {
+    parsePaidAt,
     isEnabled,
     syncAlimSales,
     syncAlimOrder,

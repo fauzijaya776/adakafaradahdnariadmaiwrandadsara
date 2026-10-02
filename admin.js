@@ -9,6 +9,7 @@ const {
 const mongoose = require('mongoose');
 const moment = require('moment-timezone');
 const alimSync = require('./alimsync');
+const alimCair = require('./alimcair');
 const {
   createTransfer,
   getProfile
@@ -192,8 +193,14 @@ async function buildAlimTrackText(rawInput) {
     }
     text += `Nominal: *${rpFmt(d.amount)}*\n` +
       `Dibayar: ${wibFmt(d.completedAt || d.createdAt)} WIB\n` +
-      (d.txnId ? `Txn Pakasir: \`${mdSafe(d.txnId)}\`\n` : '') +
-      (d.settled ? `Status: ✅ *Sudah dibayarkan* ke Alim (reset ${wibFmt(d.settledAt)})\n` : 'Status: ⏳ *Belum dibayarkan* ke Alim\n');
+      (d.txnId ? `Txn Pakasir: \`${mdSafe(d.txnId)}\`\n` : '');
+    if (d.settled) {
+      text += `Status: ✅ *Sudah dibayarkan* ke Alim (reset ${wibFmt(d.settledAt)})\n`;
+    } else {
+      const st = alimCair.statusOf(d);
+      text += 'Status: ⏳ *Belum dibayarkan* ke Alim\n' +
+        (st.ready ? `Pencairan Pakasir: ✅ *sudah bisa dicairkan* (sejak ${st.label} WIB)\n` : `Pencairan Pakasir: ⏳ *tertunda*, bisa cair ${st.label} WIB\n`);
+    }
   });
   return { found: true, text };
 }
@@ -218,13 +225,9 @@ async function handleAlimTrackInput(ctx) {
 }
 
 async function buildDanaAlimView(notice) {
-  const [agg] = await AlimSale.aggregate([
-    { $match: { settled: false } },
-    { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 }, latest: { $max: '$createdAt' } } },
-  ]);
-  const total = agg ? agg.total : 0;
-  const count = agg ? agg.count : 0;
-  const latestMs = agg && agg.latest ? new Date(agg.latest).getTime() : 0;
+  // Dipisah: sudah bisa dicairkan (H+1 12.00 WIB, Minggu -> Senin) vs masih tertunda.
+  const sum = await alimCair.summarize(AlimSale, alimSourceTotals);
+  const { total, count, cair, tertunda } = sum;
 
   const recent = await AlimSale.find({ settled: false }).sort({ createdAt: -1 }).limit(10).lean();
   const [last] = await AlimSale.aggregate([
@@ -234,19 +237,22 @@ async function buildDanaAlimView(notice) {
     { $limit: 1 },
   ]);
 
-  const bySrc = await alimSourceTotals({ settled: false });
-
   let text = notice ? `${notice}\n\n` : '';
   text += '💵 *Dana tokotelealim (Alim Store)*\n_Gabungan penjualan bot Telegram + website_\n\n' +
-    `Belum dibayarkan: *${rpFmt(total)}*\n` +
-    `Jumlah order: *${count}*\n` +
-    `├ ${ALIM_SOURCE_LABEL.tele}: ${rpFmt(bySrc.tele.total)} (${bySrc.tele.count} order)\n` +
-    `└ ${ALIM_SOURCE_LABEL.web}: ${rpFmt(bySrc.web.total)} (${bySrc.web.count} order)\n`;
+    `Belum dibayarkan: *${rpFmt(total)}* (${count} order)\n\n` +
+    `✅ *Sudah bisa dicairkan: ${rpFmt(cair.total)}* (${cair.count} order)\n` +
+    `├ ${ALIM_SOURCE_LABEL.tele}: ${rpFmt(cair.tele.total)} (${cair.tele.count} order)\n` +
+    `└ ${ALIM_SOURCE_LABEL.web}: ${rpFmt(cair.web.total)} (${cair.web.count} order)\n` +
+    `⏳ *Masih tertunda: ${rpFmt(tertunda.total)}* (${tertunda.count} order)\n`;
+  tertunda.schedule.forEach((g, i) => {
+    text += `${i === tertunda.schedule.length - 1 ? '└' : '├'} cair ${g.label}: ${rpFmt(g.total)} (${g.count} order)\n`;
+  });
   if (recent.length > 0) {
     text += `\n*${count > recent.length ? `10 order terbaru dari ${count}` : 'Daftar order'}:*\n`;
     recent.forEach((r) => {
       const icon = alimSourceOf(r.orderId) === 'web' ? '🌐' : '📱';
-      text += `${icon} ${wibFmt(r.completedAt || r.createdAt)} — ${rpFmt(r.amount)}\n   \`${r.orderId}\`\n`;
+      const st = alimCair.statusOf(r);
+      text += `${icon} ${wibFmt(r.completedAt || r.createdAt)} — ${rpFmt(r.amount)} — ${st.ready ? '✅ bisa cair' : `⏳ cair ${st.label}`}\n   \`${r.orderId}\`\n`;
     });
   } else {
     text += '\nBelum ada catatan.\n';
@@ -265,11 +271,15 @@ async function buildDanaAlimView(notice) {
   if (sync.webhookRejectedAt && (!sync.webhookOkAt || sync.webhookRejectedAt > sync.webhookOkAt)) {
     text += `\n❗ Webhook DITOLAK (X-Secret salah) terakhir: ${wibFmt(sync.webhookRejectedAt)}`;
   }
-  text += '\n\n_Hanya catatan, tidak memengaruhi saldo Pakasir._';
+  text += '\n\n_Pakasir mencairkan H+1 jam 12.00 WIB; hari Minggu libur (dibayar Sabtu/Minggu → cair Senin 12.00). Hanya catatan, tidak memengaruhi saldo Pakasir._';
 
   const rows = [];
-  // latestMs ikut di tombol: yang di-reset hanya order yang TAMPIL di layar ini.
-  if (count > 0) rows.push([Markup.button.callback('🔄 Reset ke 0 (sudah dibayar)', `dar_ask:${latestMs}`)]);
+  // Yang di-reset HANYA yang sudah bisa dicairkan dan tampil di layar ini:
+  // waktu catatan terbaru (uptoMs) + batas cair (cutoffMs) ikut di tombol.
+  if (cair.count > 0) {
+    const uptoMs = cair.latest ? cair.latest.getTime() : 0;
+    rows.push([Markup.button.callback(`🔄 Reset yang sudah cair (${rpFmt(cair.total)})`, `dar_ask:${uptoMs}:${sum.cutoff.getTime()}`)]);
+  }
   rows.push([Markup.button.callback('🔎 Lacak ID pesanan', 'dal_track')]);
   if (sync.enabled) rows.push([Markup.button.callback('🔄 Sinkronkan dari data Alim', 'dal_sync')]);
   rows.push([Markup.button.callback('♻️ Muat ulang', 'admin_dana_alim')]);
@@ -1112,24 +1122,27 @@ module.exports = (bot) => {
     }
   });
 
-  // Langkah konfirmasi sebelum reset.
-  bot.action(/^dar_ask:(\d+)$/, adminMiddleware, async (ctx) => {
+  // Langkah konfirmasi sebelum reset (hanya dana yang SUDAH BISA DICAIRKAN).
+  bot.action(/^dar_ask:(\d+)(?::(\d+))?$/, adminMiddleware, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     try {
-      const uptoMs = Number(ctx.match[1]);
+      // Tombol lama (sebelum fitur ini) hanya membawa uptoMs -> batas cair = saat ini.
+      const uptoMs = ctx.match[1];
+      const cutoffMs = alimCair.clampCutoff(ctx.match[2]).getTime();
       const [agg] = await AlimSale.aggregate([
-        { $match: { settled: false, createdAt: { $lte: new Date(uptoMs) } } },
+        { $match: alimCair.resetFilter(uptoMs, cutoffMs) },
         { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
       ]);
       if (!agg || !agg.count) {
-        const { text, keyboard } = await buildDanaAlimView('ℹ️ Tidak ada catatan untuk di-reset.');
+        const { text, keyboard } = await buildDanaAlimView('ℹ️ Tidak ada dana yang sudah bisa dicairkan untuk di-reset.');
         return safeEditOrReply(ctx, text, keyboard);
       }
-      const text = '⚠️ *Reset Dana Alim ke Rp 0?*\n\n' +
-        `*${agg.count}* order senilai *${rpFmt(agg.total)}* akan ditandai *SUDAH DIBAYARKAN*.\n` +
+      const text = '⚠️ *Reset Dana Alim yang sudah cair?*\n\n' +
+        `*${agg.count}* order senilai *${rpFmt(agg.total)}* yang *sudah bisa dicairkan* akan ditandai *SUDAH DIBAYARKAN*.\n` +
+        'Order yang masih tertunda tidak ikut di-reset.\n' +
         'Data tetap disimpan sebagai riwayat.';
       const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('✅ Ya, reset', `dar_ok:${uptoMs}`)],
+        [Markup.button.callback('✅ Ya, reset', `dar_ok:${uptoMs}:${cutoffMs}`)],
         [Markup.button.callback('⬅️ Batal', 'admin_dana_alim')],
       ]);
       await safeEditOrReply(ctx, text, keyboard);
@@ -1139,17 +1152,12 @@ module.exports = (bot) => {
     }
   });
 
-  bot.action(/^dar_ok:(\d+)$/, adminMiddleware, async (ctx) => {
+  bot.action(/^dar_ok:(\d+)(?::(\d+))?$/, adminMiddleware, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     try {
-      const filter = { settled: false, createdAt: { $lte: new Date(Number(ctx.match[1])) } };
-      const [agg] = await AlimSale.aggregate([
-        { $match: filter },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]);
-      const r = await AlimSale.updateMany(filter, { $set: { settled: true, settledAt: new Date() } });
-      const notice = r.modifiedCount > 0
-        ? `✅ Berhasil di-reset: *${r.modifiedCount}* order senilai *${rpFmt(agg ? agg.total : 0)}* ditandai sudah dibayarkan.`
+      const r = await alimCair.settle(AlimSale, alimCair.resetFilter(ctx.match[1], ctx.match[2]));
+      const notice = r.count > 0
+        ? `✅ Berhasil di-reset: *${r.count}* order (sudah cair) senilai *${rpFmt(r.total)}* ditandai sudah dibayarkan.`
         : 'ℹ️ Tidak ada catatan yang di-reset (sudah di-reset sebelumnya).';
       const { text, keyboard } = await buildDanaAlimView(notice);
       await safeEditOrReply(ctx, text, keyboard);

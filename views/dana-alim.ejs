@@ -1,12 +1,12 @@
 <div class="max-w-4xl">
     <% if (resetCount !== null && resetCount > 0) { %>
         <div class="mb-6 text-sm rounded-lg px-4 py-3 bg-green-50 text-green-700 border border-green-100">
-            Berhasil di-reset: <b><%= resetCount %></b> catatan senilai
+            Berhasil di-reset: <b><%= resetCount %></b> catatan (sudah cair) senilai
             <b>Rp <%= Number(resetTotal || 0).toLocaleString('id-ID') %></b> ditandai sudah dibayarkan.
         </div>
     <% } else if (resetCount === 0) { %>
         <div class="mb-6 text-sm rounded-lg px-4 py-3 bg-gray-50 text-gray-600 border border-gray-100">
-            Tidak ada catatan yang di-reset (sudah 0 atau sudah di-reset sebelumnya).
+            Tidak ada catatan yang di-reset (belum ada dana yang bisa dicairkan, atau sudah di-reset sebelumnya).
         </div>
     <% } %>
     <% if (syncNotice && syncNotice.error) { %>
@@ -33,33 +33,60 @@
             dibayarkan saat pencairan. Hanya catatan — tidak memengaruhi saldo Pakasir.
         </p>
 
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
-            <div class="rounded-lg border border-purple-100 bg-purple-50 p-5">
-                <div class="text-xs text-purple-700 mb-1">Total belum dibayarkan</div>
-                <div class="text-3xl font-bold text-purple-800">Rp <%= Number(total).toLocaleString('id-ID') %></div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+            <div class="rounded-lg border border-green-200 bg-green-50 p-5">
+                <div class="text-xs text-green-700 mb-1">✅ Sudah bisa dicairkan</div>
+                <div class="text-3xl font-bold text-green-800">Rp <%= Number(cair.total).toLocaleString('id-ID') %></div>
+                <div class="text-xs text-green-700 mt-1"><%= cair.count %> order</div>
+                <div class="text-xs text-green-800 mt-3 space-y-0.5">
+                    <div>📱 Telegram: Rp <%= Number(cair.tele.total).toLocaleString('id-ID') %> (<%= cair.tele.count %>)</div>
+                    <div>🌐 Website: Rp <%= Number(cair.web.total).toLocaleString('id-ID') %> (<%= cair.web.count %>)</div>
+                </div>
             </div>
-            <div class="rounded-lg border border-gray-100 p-5">
-                <div class="text-xs text-gray-500 mb-1">Jumlah order tercatat</div>
-                <div class="text-3xl font-bold text-gray-800"><%= count %></div>
+            <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
+                <div class="text-xs text-amber-700 mb-1">⏳ Masih tertunda (belum bisa dicairkan)</div>
+                <div class="text-3xl font-bold text-amber-800">Rp <%= Number(tertunda.total).toLocaleString('id-ID') %></div>
+                <div class="text-xs text-amber-700 mt-1"><%= tertunda.count %> order</div>
+                <% if (tertunda.schedule.length) { %>
+                    <div class="text-xs text-amber-900 mt-3 space-y-0.5">
+                        <% tertunda.schedule.forEach(function (g) { %>
+                            <div>Cair <b><%= g.label %></b> WIB: Rp <%= Number(g.total).toLocaleString('id-ID') %> (<%= g.count %>)</div>
+                        <% }) %>
+                    </div>
+                <% } %>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+            <div class="rounded-lg border border-purple-100 bg-purple-50 p-4">
+                <div class="text-xs text-purple-700 mb-1">Total belum dibayarkan</div>
+                <div class="text-xl font-bold text-purple-800">Rp <%= Number(total).toLocaleString('id-ID') %></div>
+                <div class="text-xs text-purple-700"><%= count %> order</div>
             </div>
             <div class="rounded-lg border border-sky-100 bg-sky-50 p-4">
                 <div class="text-xs text-sky-700 mb-1">📱 Dari bot Telegram (ALIM-)</div>
                 <div class="text-xl font-bold text-sky-900">Rp <%= Number(bySrc.tele.total).toLocaleString('id-ID') %></div>
                 <div class="text-xs text-sky-700"><%= bySrc.tele.count %> order</div>
             </div>
-            <div class="rounded-lg border border-amber-100 bg-amber-50 p-4">
-                <div class="text-xs text-amber-700 mb-1">🌐 Dari website (WEBALIM-)</div>
-                <div class="text-xl font-bold text-amber-900">Rp <%= Number(bySrc.web.total).toLocaleString('id-ID') %></div>
-                <div class="text-xs text-amber-700"><%= bySrc.web.count %> order</div>
+            <div class="rounded-lg border border-orange-100 bg-orange-50 p-4">
+                <div class="text-xs text-orange-700 mb-1">🌐 Dari website (WEBALIM-)</div>
+                <div class="text-xl font-bold text-orange-900">Rp <%= Number(bySrc.web.total).toLocaleString('id-ID') %></div>
+                <div class="text-xs text-orange-700"><%= bySrc.web.count %> order</div>
             </div>
         </div>
 
+        <p class="text-xs text-gray-500 mb-4">
+            Pakasir mencairkan dana H+1 jam 12.00 WIB. Hari Minggu libur: order yang dibayar Sabtu atau Minggu cair Senin jam 12.00 WIB.
+            Reset hanya menandai dana yang <b>sudah bisa dicairkan</b>; yang masih tertunda tetap tercatat untuk pembayaran berikutnya.
+        </p>
+
         <form method="POST" action="/dana-alim/reset"
-              onsubmit="return confirm('Reset catatan ke Rp 0?\n\nTotal Rp <%= Number(total).toLocaleString('id-ID') %> (<%= count %> order) akan ditandai SUDAH DIBAYARKAN. Data tetap tersimpan di riwayat.');">
-            <input type="hidden" name="upto" value="<%= upto %>">
-            <button type="submit" <%= count === 0 ? 'disabled' : '' %>
+              onsubmit="return confirm('Reset dana yang SUDAH BISA DICAIRKAN?\n\nRp <%= Number(cair.total).toLocaleString('id-ID') %> (<%= cair.count %> order) akan ditandai SUDAH DIBAYARKAN.\nYang masih tertunda (Rp <%= Number(tertunda.total).toLocaleString('id-ID') %>) tidak ikut. Data tetap tersimpan di riwayat.');">
+            <input type="hidden" name="upto" value="<%= cair.upto %>">
+            <input type="hidden" name="cutoff" value="<%= cair.cutoff %>">
+            <button type="submit" <%= cair.count === 0 ? 'disabled' : '' %>
                 class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2.5 px-5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed">
-                Reset ke 0 (sudah dibayarkan)
+                Reset yang sudah cair (sudah dibayarkan)
             </button>
         </form>
     </div>
@@ -151,7 +178,7 @@
                                     <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.source === 'web' ? '🌐 Website' : '📱 Telegram' %>
                                         <% if (it.buyer) { %><div class="text-xs text-gray-400">ID TG <%= it.buyer %></div><% } %></td>
                                     <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.when %></td>
-                                    <td class="py-2 pr-4 whitespace-nowrap"><% if (it.settled) { %><span class="text-green-700">✅ Sudah dibayarkan</span><div class="text-xs text-gray-400">reset <%= it.settledAt %></div><% } else { %><span class="text-amber-700">⏳ Belum dibayarkan</span><% } %></td>
+                                    <td class="py-2 pr-4 whitespace-nowrap"><% if (it.settled) { %><span class="text-green-700">✅ Sudah dibayarkan</span><div class="text-xs text-gray-400">reset <%= it.settledAt %></div><% } else { %><span class="text-amber-700">⏳ Belum dibayarkan</span><div class="text-xs <%= it.cairReady ? 'text-green-700' : 'text-gray-400' %>"><%= it.cairReady ? '✅ sudah bisa dicairkan' : 'cair ' + it.cairLabel + ' WIB' %></div><% } %></td>
                                     <td class="py-2 text-right text-gray-800">Rp <%= Number(it.amount).toLocaleString('id-ID') %></td>
                                 </tr>
                             <% }) %>
@@ -174,6 +201,7 @@
                             <th class="py-2 pr-4 font-medium">Waktu (WIB)</th>
                             <th class="py-2 pr-4 font-medium">ID Order</th>
                             <th class="py-2 pr-4 font-medium">Sumber</th>
+                            <th class="py-2 pr-4 font-medium">Pencairan</th>
                             <th class="py-2 font-medium text-right">Nominal</th>
                         </tr>
                     </thead>
@@ -183,6 +211,7 @@
                                 <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.when %></td>
                                 <td class="py-2 pr-4 font-mono text-xs text-gray-700"><a class="hover:underline" href="/dana-alim?q=<%= encodeURIComponent(it.orderId) %>"><%= it.orderId %></a></td>
                                 <td class="py-2 pr-4 text-gray-600 whitespace-nowrap"><%= it.source === 'web' ? '🌐 Website' : '📱 Telegram' %></td>
+                                <td class="py-2 pr-4 whitespace-nowrap"><% if (it.cairReady) { %><span class="text-green-700">✅ Bisa cair</span><% } else { %><span class="text-amber-700">⏳ <%= it.cairLabel %></span><% } %></td>
                                 <td class="py-2 text-right text-gray-800">Rp <%= Number(it.amount).toLocaleString('id-ID') %></td>
                             </tr>
                         <% }) %>

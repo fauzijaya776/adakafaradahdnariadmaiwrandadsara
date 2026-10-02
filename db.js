@@ -144,9 +144,11 @@ const AlimSaleSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now },
     settled: { type: Boolean, default: false },
     settledAt: Date,
+    settleBatch: String,                    // penanda satu kali reset (lihat alimcair.js settle)
     via: String,                            // 'webhook' (notifikasi Pakasir) | 'sync' (dari database Alim, lihat alimsync.js)
 });
 AlimSaleSchema.index({ settled: 1, createdAt: -1 });
+AlimSaleSchema.index({ settleBatch: 1 }, { sparse: true });
 
 // Cache hasil cek Gmail (QuickEmailVerification) per alamat email, supaya akun
 // yang baru dicek tidak memakan kuota lagi (mis. pembeli batal lalu dibeli orang lain).

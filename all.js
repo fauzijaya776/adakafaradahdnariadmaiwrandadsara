@@ -26,6 +26,7 @@ const pakasir = require('./qris_pakasir');
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const alimSync = require('./alimsync');
+const alimCair = require('./alimcair'); // jadwal cair Dana Alim (H+1 12.00 WIB, Minggu -> Senin)
 const QRCode = require('qrcode');
 const docheck = require('./docheck');
 
@@ -987,15 +988,18 @@ function fmtWIB(d) {
 
 app.get('/dana-alim', authMiddleware, async (req, res) => {
     try {
-        const [agg] = await AlimSale.aggregate([
-            { $match: { settled: false } },
-            { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 }, latest: { $max: '$createdAt' } } },
-        ]);
-        const total = agg ? agg.total : 0;
-        const count = agg ? agg.count : 0;
-        const upto = agg && agg.latest ? new Date(agg.latest).toISOString() : '';
         // Rincian per sumber: bot Telegram (ALIM-…) dan website (WEBALIM-…)
         const bySrc = await adminModule.alimSourceTotals({ settled: false });
+        // Dipisah: sudah bisa dicairkan (H+1 12.00 WIB, Minggu -> Senin) vs masih tertunda.
+        // Reset hanya untuk yang sudah cair & tampil di layar ini (upto + cutoff ikut di form).
+        const cairSum = await alimCair.summarize(AlimSale, adminModule.alimSourceTotals);
+        const { total, count } = cairSum;
+        const cair = {
+            ...cairSum.cair,
+            upto: cairSum.cair.latest ? cairSum.cair.latest.toISOString() : '',
+            cutoff: cairSum.cutoff.toISOString(),
+        };
+        const tertunda = cairSum.tertunda;
 
         // Lacak ID pesanan (?q=...) — mencari di SEMUA catatan, termasuk yang sudah dibayarkan.
         const q = String(req.query.q || '').trim().toUpperCase().replace(/\s+/g, '').slice(0, 64);
@@ -1015,11 +1019,15 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
         }
         const srcOf = (id) => (/^WEBALIM-/.test(String(id || '')) ? 'web' : 'tele');
         const buyerOf = (id) => { const m = String(id || '').match(/^ALIM-(\d+)-/); return m ? m[1] : ''; };
-        const view = (i) => ({
-            orderId: i.orderId, amount: i.amount, when: fmtWIB(i.completedAt || i.createdAt),
-            source: srcOf(i.orderId), buyer: buyerOf(i.orderId), txnId: i.txnId || '',
-            settled: !!i.settled, settledAt: i.settled ? fmtWIB(i.settledAt) : '',
-        });
+        const view = (i) => {
+            const st = alimCair.statusOf(i);
+            return {
+                orderId: i.orderId, amount: i.amount, when: fmtWIB(i.completedAt || i.createdAt),
+                source: srcOf(i.orderId), buyer: buyerOf(i.orderId), txnId: i.txnId || '',
+                settled: !!i.settled, settledAt: i.settled ? fmtWIB(i.settledAt) : '',
+                cairReady: st.ready, cairLabel: st.label,
+            };
+        };
 
         const items = await AlimSale.find({ settled: false }).sort({ createdAt: -1 }).limit(100).lean();
         const history = await AlimSale.aggregate([
@@ -1050,7 +1058,7 @@ app.get('/dana-alim', authMiddleware, async (req, res) => {
         res.render('layout', {
             page: 'dana-alim',
             body: await ejs.renderFile(path.join(__dirname, 'views/dana-alim.ejs'), {
-                total, count, upto, bySrc,
+                total, count, bySrc, cair, tertunda,
                 sync: syncView, syncNotice,
                 q, found: found ? found.map(view) : null,
                 lookup: lookup && lookup.enabled ? {
@@ -1076,21 +1084,14 @@ app.post('/dana-alim/sync', authMiddleware, async (req, res) => {
     res.redirect(`/dana-alim?synced=${r.recorded || 0}&sa=${r.recordedAmount || 0}`);
 });
 
-// Reset ke 0 = tandai catatan sebagai SUDAH DIBAYARKAN (data tetap disimpan sbg riwayat).
-// Hanya catatan s/d `upto` (yang tampil di layar) yang di-reset, supaya order yang
-// baru masuk saat halaman sedang terbuka tidak ikut ter-reset tanpa terlihat.
+// Reset = tandai catatan sebagai SUDAH DIBAYARKAN (data tetap disimpan sbg riwayat).
+// Hanya yang SUDAH BISA DICAIRKAN dan tampil di layar (lihat alimCair.resetFilter — sama
+// dengan tombol reset di Telegram).
 app.post('/dana-alim/reset', authMiddleware, async (req, res) => {
     try {
-        const filter = { settled: false };
-        const upto = req.body && req.body.upto ? new Date(req.body.upto) : null;
-        if (upto && !isNaN(upto.getTime())) filter.createdAt = { $lte: upto };
-
-        const [agg] = await AlimSale.aggregate([
-            { $match: filter },
-            { $group: { _id: null, total: { $sum: '$amount' } } },
-        ]);
-        const r = await AlimSale.updateMany(filter, { $set: { settled: true, settledAt: new Date() } });
-        res.redirect(`/dana-alim?reset=${r.modifiedCount || 0}&rt=${agg ? agg.total : 0}`);
+        const body = req.body || {};
+        const r = await alimCair.settle(AlimSale, alimCair.resetFilter(body.upto, body.cutoff));
+        res.redirect(`/dana-alim?reset=${r.count}&rt=${r.total}`);
     } catch (error) {
         console.error("Dana Alim Reset Error:", error);
         res.status(500).send("Error resetting Dana Alim.");

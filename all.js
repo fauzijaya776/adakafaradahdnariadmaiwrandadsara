@@ -23,6 +23,8 @@ const dana = require('./qris_dana');
 const tokopay = require('./qris_tokopay');
 const qrin = require('./qris_qrin');
 const pakasir = require('./qris_pakasir');
+const autogopay = require('./qris_autogopay');
+const agpSafety = require('./autogopay_safety')({ mongoose, Order, Product, User, Settings });
 const linkqu = require('./qris_linkqu');
 const adminModule = require('./admin');
 const alimSync = require('./alimsync');
@@ -68,11 +70,46 @@ const pembeliDo = createPembeliDo({
     channel: process.env.TESTI_CHANNEL && !/^off$/i.test(process.env.TESTI_CHANNEL) ? process.env.TESTI_CHANNEL : '@FZISTORE',
 });
 // === 2. INISIALISASI & KONEKSI DATABASE ===
-connectDB(); 
+let agpReady = false;
+const databaseReady = connectDB().then(async () => {
+    // Await unique indexes and protect invoices created by earlier migration revisions.
+    await Order.init(); await Settings.init();
+    await Order.updateMany({ paymentGateway: 'autogopay' }, { $unset: { expiresAt: '' } });
+    const unresolved = await Order.find({ paymentGateway: 'autogopay', status: 'PENDING' }).limit(2).lean();
+    if (unresolved.length) {
+        await Settings.updateOne({ identifier: 'global-settings' }, { $set: {
+            autogopayActiveOrder: unresolved[0].orderId,
+            ...(unresolved.length > 1 ? { autogopayCircuitOpen: true } : {}),
+        } }, { upsert: true });
+    }
+    agpReady = true;
+}).catch(error => { console.error('[AUTOGOPAY] Startup safety checks failed:', error.message); });
 
 // Inisialisasi Express App dan Telegraf Bot
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const agpDelivery = require('./autogopay_delivery')({
+    Order, telegram: bot.telegram,
+    formatItemsForFile: async (items, order) => {
+        const product = await Product.findOne({ id: order.productId });
+        const variant = product?.variants.find(v => v.slug === order.variantSlug);
+        return `${order.productName || 'Pesanan'}\nOrder: ${order.orderId}\n\n${formatItemsForFile(items)}` +
+            (variant?.snk ? `\n\nSyarat & Ketentuan:\n${variant.snk}` : '');
+    },
+    onReview: async (order, reason) => {
+        if (order.status === 'PAID') return alertOwnerDeliveryFailed(order, reason);
+        for (const owner of ownerIdList()) {
+            await bot.telegram.sendMessage(owner, `⚠️ PEMBAYARAN BELUM TERKONFIRMASI LUNAS\nOrder: ${order.orderId}\n${reason}\nJangan kirim akun atau lepaskan stok sebelum cocok dengan dashboard provider.`).catch(() => {});
+        }
+    },
+    onDelivered: async order => {
+        if (GROUP_NOTIF_ID) await sendAdminNotification(bot, order).catch(() => {});
+        await notifyOwnerNewOrder(order).catch(() => {});
+        testimoni.enqueue(bot, order, 'QRIS AutoGoPay').catch(() => {});
+    },
+});
+async function deliverAutoGoPay(order) { return agpDelivery.deliver(order); }
+
 // Setiap update Telegram diproses di LATAR BELAKANG. Tanpa ini Telegraf menunggu
 // handler selesai sebelum mengambil update berikutnya, jadi proses panjang
 // (cek Gmail, /statusdo, /cekdo, membuat QRIS) membuat bot diam untuk SEMUA pembeli.
@@ -217,6 +254,7 @@ async function runStorageMaintenance() {
         const strandedCutoff = new Date(Date.now() - 60 * 60 * 1000);
         const stranded = await Order.find({
             status: 'PENDING',
+            paymentGateway: { $ne: 'autogopay' },
             createdAt: { $lt: strandedCutoff },
             reservedItems: { $exists: true, $ne: [] }
         }).lean();
@@ -252,22 +290,24 @@ async function runStorageMaintenance() {
         const pakasirCutoff = new Date(Date.now() - PAKASIR_KEEP_HOURS * 60 * 60 * 1000);
         const deleted = await Order.deleteMany({
             status: { $ne: 'PAID' },
+            paymentGateway: { $ne: 'autogopay' },
             createdAt: { $lt: junkCutoff },
             // order Pakasir ditahan lebih lama (pembayaran telat masih mungkin masuk)
-            $or: [{ paymentGateway: { $ne: 'pakasir' } }, { createdAt: { $lt: pakasirCutoff } }],
+            $or: [{ paymentGateway: { $nin: ['pakasir', 'autogopay'] } }, { createdAt: { $lt: pakasirCutoff } }],
         });
 
         const stripCutoff = new Date(Date.now() - PAID_ITEMS_RETENTION_DAYS * 24 * 60 * 60 * 1000);
         const stripped = await Order.updateMany(
             {
                 status: 'PAID',
+                delivered: true,
                 createdAt: { $lt: stripCutoff },
                 $or: [
                     { reservedItems: { $exists: true, $ne: [] } },
                     { paymentDetails: { $exists: true, $ne: null } }
                 ]
             },
-            { $set: { reservedItems: [] }, $unset: { paymentDetails: '' } }
+            { $set: { reservedItems: [], reservationAudit: [] }, $unset: { paymentDetails: '', autogopayQrString: '' } }
         );
 
         if (deleted.deletedCount > 0 || stripped.modifiedCount > 0) {
@@ -395,7 +435,7 @@ async function alertOwnerDeliveryFailed(order, reason) {
         `Jumlah: ${order.quantity}x`,
         `Sebab: ${escapeMd(reason)}`,
         '',
-        `Kirim manual akun di file berikut, lalu jalankan \`/resend ${order.orderId}\` bila customer sudah bisa menerima.`,
+        `Periksa chat pembeli dahulu. Jika belum diterima, kirim akun yang sama dari file berikut; gunakan \`/resend ${order.orderId}\` bila customer sudah bisa menerima.`,
     ].join('\n');
     const fileContent = formatItemsForFile(order.reservedItems || []);
     for (const o of owners) {
@@ -425,6 +465,7 @@ async function sendMessageWithFallback(chatId, markdownMsg) {
 }
 
 async function deliverAccountsToCustomer(order, methodLabel) {
+    if (order.paymentGateway === 'autogopay') return deliverAutoGoPay(order);
     const chatId = order.customerInfo?.telegramUserId;
     if (!chatId) {
         await alertOwnerDeliveryFailed(order, 'telegramUserId customer kosong');
@@ -549,11 +590,11 @@ app.use(session({
 
 // Login panel web diambil dari env (Render -> Environment):
 //   ADMIN_USERNAME=...   ADMIN_PASSWORD=...
-// Kalau belum diisi, sementara masih memakai gen/gen (owner diberi peringatan).
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'gen';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'gen';
-const ADMIN_DEFAULT_LOGIN = !process.env.ADMIN_USERNAME || !process.env.ADMIN_PASSWORD;
-if (ADMIN_DEFAULT_LOGIN) console.warn('[PANEL] ADMIN_USERNAME/ADMIN_PASSWORD belum diisi di env -> login panel masih gen/gen (TIDAK AMAN).');
+// Panel tidak menerima login bila konfigurasi admin belum aman.
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const ADMIN_DEFAULT_LOGIN = !ADMIN_USERNAME || ADMIN_PASSWORD.length < 12;
+if (ADMIN_DEFAULT_LOGIN) console.warn('[PANEL] Login dinonaktifkan: isi ADMIN_USERNAME dan ADMIN_PASSWORD minimal 12 karakter.');
 
 function safeEqual(a, b) {
     const crypto = require('crypto');
@@ -572,6 +613,7 @@ function clientIp(req) {
 }
 
 const authMiddleware = (req, res, next) => {
+    if (ADMIN_DEFAULT_LOGIN) return res.status(503).send('Panel admin belum dikonfigurasi.');
     if (req.session.loggedin) {
         res.locals.user = req.session.user;
         next();
@@ -584,6 +626,7 @@ const authMiddleware = (req, res, next) => {
 app.get('/login', (req, res) => res.render('login', { error: req.query.error, success: req.query.success, locals: {} }));
 
 app.post('/login', (req, res) => {
+    if (ADMIN_DEFAULT_LOGIN) return res.status(503).send('Panel admin belum dikonfigurasi.');
     const ip = clientIp(req);
     const now = Date.now();
     const rec = loginFails.get(ip);
@@ -593,7 +636,8 @@ app.post('/login', (req, res) => {
     const { username, password } = req.body;
     if (safeEqual(username, ADMIN_USERNAME) && safeEqual(password, ADMIN_PASSWORD)) {
         loginFails.delete(ip);
-        req.session.regenerate(() => {
+        req.session.regenerate(error => {
+            if (error) return res.status(503).send('Sesi login belum tersedia.');
             req.session.loggedin = true;
             req.session.user = { username: String(username) };
             res.redirect('/');
@@ -1503,8 +1547,8 @@ async function generatePaymentMessageAndKeyboard(productId, variantSlug, quantit
         //row1.push(Markup.button.callback('DANA', `dana_${productId}_${variantSlug}_${quantity}`));
     //}
     if (settings.tokopay_enabled) {
-        // QRIS (ALL) kini memakai Pakasir sebagai payment gateway.
-        row2.push(Markup.button.callback('QRIS (ALL)', `pakasir_${productId}_${variantSlug}_${quantity}`));
+        // QRIS baru memakai AutoGoPay. Flag tokopay_enabled dipertahankan untuk kompatibilitas admin.
+        row2.push(Markup.button.callback('QRIS (ALL)', `autogopay_${productId}_${variantSlug}_${quantity}`));
     }
 
     //if (row1.length > 0) keyboardRows.push(row1);
@@ -1872,6 +1916,12 @@ bot.action(/^back_to_details_([^_]+)_page_(\d+)$/, async (ctx) => {
 });
 
 // FINAL -NOTIF/all.js
+
+// Legacy create buttons cannot bypass the new merchant generation policy.
+bot.action(/^(?:dana|qris|tokopay)_([^_]+)_(.*?)_(\d+)$/, async ctx => {
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.reply('Metode pembayaran sudah diperbarui. Buka /start untuk membuat pesanan baru. Invoice yang sudah dibuat tetap dipantau.');
+});
 
 bot.action(/^dana_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     let workingMsg, qrPhotoMsg;
@@ -2381,6 +2431,251 @@ async function fulfillQrinPaidOrder(orderId) {
 // (pakai txn_id), jadi TIDAK wajib domain/callback.
 // Webhook Pakasir v2 (header X-Secret) tetap didukung sebagai cadangan (route /callback).
 // =================================================================
+// AutoGoPay: new invoices; legacy Pakasir routes stay available for pending orders.
+async function showExistingAutoGoPayInvoice(ctx, active) {
+    if (!active.autogopayQrString || !active.autogopayExpiresAt || new Date(active.autogopayExpiresAt) <= new Date()) {
+        return ctx.reply(`Pesanan ${active.orderId} masih diperiksa. Jangan membayar invoice pengganti; hubungi admin.`);
+    }
+    const claimed = await Order.findOneAndUpdate({ orderId: active.orderId, status: 'PENDING',
+        'customerInfo.telegramUserId': String(ctx.from.id),
+        $or: [{ invoiceRedisplayAt: { $exists: false } }, { invoiceRedisplayAt: { $lt: new Date(Date.now() - 30000) } }],
+    }, { $set: { invoiceRedisplayAt: new Date() } }, { new: true });
+    if (!claimed) return ctx.reply('Gunakan QRIS yang sudah dikirim. Tunggu 30 detik untuk menampilkannya kembali.');
+    const qr = await QRCode.toBuffer(claimed.autogopayQrString, { width: 512, margin: 2 });
+    await ctx.replyWithPhoto({ source: qr }, { caption: `Invoice yang sama (bukan QRIS baru)\nOrder: ${claimed.orderId}\nTotal: Rp ${claimed.totalPaid || claimed.amount}\nBerlaku sampai: ${moment(claimed.autogopayExpiresAt).tz('Asia/Jakarta').format('HH:mm:ss')} WIB`,
+        reply_markup: Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_autogopay_${claimed.orderId}`)]]).reply_markup });
+}
+const autogopayCreating = new Set();
+bot.action(/^(?:autogopay|pakasir)_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
+    let workingMsg, qrPhotoMsg;
+    const productId = ctx.match[1];
+    const variantSlug = ctx.match[2];
+    const quantity = parseInt(ctx.match[3]);
+    const internalOrderId = `AGP-${ctx.from.id}-${Date.now().toString(36)}`;
+    if (!agpReady) return ctx.answerCbQuery('Sistem pembayaran belum siap. Tunggu sebentar.').catch(() => {});
+    if (!process.env.AUTOGOPAY_API_KEY) return ctx.answerCbQuery('Pembayaran belum dikonfigurasi. Hubungi admin.').catch(() => {});
+    const buyerId = ctx.from.id.toString();
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
+        return ctx.answerCbQuery('Jumlah tidak valid.').catch(() => {});
+    }
+    if (autogopayCreating.has(buyerId)) return ctx.answerCbQuery('QRIS sedang disiapkan.').catch(() => {});
+    autogopayCreating.add(buyerId);
+    try {
+        await ctx.answerCbQuery().catch(() => {});
+        const active = await Order.findOne({ paymentGateway: 'autogopay',
+            'customerInfo.telegramUserId': buyerId, status: 'PENDING' }).lean();
+        if (active) {
+            await showExistingAutoGoPayInvoice(ctx, active);
+            return;
+        }
+    // Cek akun Gmail live dulu (hanya varian Gmail) SEBELUM stok direservasi & QRIS dibuat.
+    const gmailPre = await gmailcheck.precheck(ctx, productId, variantSlug, quantity);
+    if (!gmailPre.proceed) return;
+    let reservedItems = [];
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    let transactionCommitted = false;
+
+    try {
+        await ctx.deleteMessage().catch(() => {});
+        workingMsg = await ctx.reply('⏳ *Menyiapkan QRIS, mohon tunggu...*', { parse_mode: 'Markdown' });
+
+        await agpSafety.claimGeneration(internalOrderId, buyerId, session);
+        const product = await Product.findOne({ id: productId }).session(session);
+        if (!product) throw new Error('Produk tidak ditemukan.');
+        const variant = product.variants.find(v => v.slug === variantSlug);
+        if (!variant || !variant.stock || variant.stock.length < quantity) {
+            throw new Error('Maaf, stok tidak mencukupi.');
+        }
+
+        // Ambil stok: dahulukan akun Gmail yang sudah lolos cek (produk lain: dari depan seperti biasa).
+        reservedItems = gmailcheck.takeFromStock(variant, quantity, gmailPre.preferred);
+        if (reservedItems.length !== quantity || new Set(reservedItems).size !== quantity ||
+            reservedItems.some(item => variant.reserved_stock.includes(item))) throw new Error('Stok duplikat/tidak konsisten. Hubungi admin.');
+        variant.reserved_stock.push(...reservedItems);
+        await product.save({ session });
+
+        let hargaPerPcs = variant.price;
+        if (variant.bulk_pricing && quantity >= variant.bulk_pricing.min_quantity) {
+            hargaPerPcs = variant.bulk_pricing.price_per_item;
+        }
+        const totalHarga = quantity * hargaPerPcs;
+        if (!Number.isSafeInteger(totalHarga) || totalHarga < 1 || totalHarga > 10000000) {
+            throw new Error('Nominal QRIS harus bulat antara Rp 1 dan Rp 10.000.000.');
+        }
+
+        // Simpan reservasi stok + order DULU (transaksi DB singkat), baru panggil AutoGoPay
+        // di LUAR transaksi. Dengan begitu pembeli lain tidak kena "write conflict" saat
+        // server AutoGoPay lambat. Hasil generate yang tidak pasti ditahan untuk rekonsiliasi.
+        await new Order({
+            orderId: internalOrderId,
+            internalRefId: internalOrderId,
+            amount: totalHarga,           // nominal dasar (diterima merchant) -> statistik
+            status: "PENDING",
+            inventoryState: 'HELD',
+            reservationAudit: reservedItems.slice(),
+            activeBuyerKey: buyerId,
+            productId, variantSlug, productName: product.name, variantName: variant.name, quantity, reservedItems,
+            customerInfo: { telegramUserId: ctx.from.id.toString(), first_name: ctx.from.first_name },
+            paymentGateway: "autogopay",
+            gmailResultMsgId: gmailPre.resultMsgId || undefined,              // pesan hasil cek Gmail (dihapus bila batal/kedaluwarsa)
+            gmailUnverified: gmailcheck.countUnverified(reservedItems) || undefined, // akun Gmail terkirim tanpa cek live
+        }).save({ session });
+        await session.commitTransaction();
+        transactionCommitted = true;
+
+        const rawPayment = await autogopay.createTransaction(internalOrderId, totalHarga, async identity => {
+            // Persist provider identity before parsing expiry or rendering the QR image.
+            await Order.updateOne({ orderId: internalOrderId, paymentGateway: 'autogopay' }, {
+                $set: { autogopayTxnId: identity.txnId, depositId: identity.realOrderId },
+            });
+        });
+        console.log('[AUTOGOPAY] Invoice dibuat:', JSON.stringify({ order: internalOrderId, txn: rawPayment.txnId, amount: rawPayment.amount, fee: rawPayment.fee, total: rawPayment.totalBayar }));
+
+        const payment = {
+            displayOrderId: internalOrderId,
+            realOrderId: rawPayment.realOrderId,
+            txnId: rawPayment.txnId,                     // transaction_id untuk status
+            qrString: rawPayment.qrString,
+            amount: rawPayment.amount,                   // nominal dasar (diterima merchant)
+            totalBayar: rawPayment.totalBayar,           // yang dibayar customer (sudah + fee)
+            fee: rawPayment.fee,
+        };
+        if (!payment.qrString) throw new Error("QR String tidak ditemukan dari response AutoGoPay");
+
+        await Order.updateOne(
+            { orderId: internalOrderId },
+            { $set: { autogopayTxnId: payment.txnId, autogopayExpiresAt: rawPayment.expiresAt, autogopayQrString: payment.qrString, fee: payment.fee, totalPaid: payment.totalBayar, depositId: payment.realOrderId } }
+        );
+
+        const qrDataURL = await QRCode.toDataURL(payment.qrString, {
+            type: 'image/png', width: 512, margin: 2, errorCorrectionLevel: 'M',
+            color: { dark: '#000000', light: '#FFFFFF' }
+        });
+        const qrBuffer = Buffer.from(qrDataURL.split(",")[1], "base64");
+
+        // Nama produk/varian di-escape supaya karakter _ * ` [ tidak merusak format (invoice gagal tampil).
+        const caption = `📁 *Invoice Berhasil Dibuat*\n\`\`\`\n${payment.displayOrderId}\n\`\`\`\n────────────✧\n*QRIS SEMUA PEMBAYARAN*\n────────────✧\n*Informasi Item:*\n— Nama: ${escapeMd(String(product.name).toUpperCase())} - ${escapeMd(variant.name)}\n— Jumlah: ${quantity}x\n\n*Informasi Pembayaran:*\n— ID Transaksi: \`${payment.displayOrderId}\`\n— Harga: Rp ${Number(payment.amount).toLocaleString('id-ID')}\n— Biaya QRIS: Rp ${Number(payment.fee).toLocaleString('id-ID')}\n— Total Dibayar: Rp ${Number(payment.totalBayar).toLocaleString('id-ID')}\n— Berlaku sampai: ${moment(rawPayment.expiresAt).tz('Asia/Jakarta').format('HH:mm:ss')} WIB`;
+        const keyboard = Markup.inlineKeyboard([[Markup.button.callback('Batalkan Pembelian', `cancel_payment_autogopay_${payment.displayOrderId}`)]]);
+
+        await ctx.deleteMessage().catch(() => {});
+        // hapus "⏳ Menyiapkan QRIS..." supaya tidak tertinggal di chat
+        if (workingMsg) { await ctx.deleteMessage(workingMsg.message_id).catch(() => {}); workingMsg = null; }
+        qrPhotoMsg = await ctx.replyWithPhoto({ source: qrBuffer }, { caption, parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+        await Order.updateOne({ orderId: internalOrderId }, { $set: { qrMsgId: qrPhotoMsg.message_id } }).catch(() => {});
+        const stillPending = await Order.exists({ orderId: internalOrderId, status: 'PENDING' });
+        if (!stillPending) {
+            await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
+            return;
+        }
+
+        // Konfirmasi tiap 10 detik sampai expiry_time dari provider.
+        // Cadangan: sweeper mengecek ulang setiap menit setelah restart.
+        const pollInterval = 10000;
+        const pollDuration = Math.max(1000, rawPayment.expiresAt.getTime() - Date.now());
+        let isHandled = false;       // timer sudah dihentikan (lunas / kedaluwarsa)
+        let polling = false;         // cegah request cek status menumpuk
+        const startedAt = Date.now();
+
+        const finish = () => {
+            const s = paymentSessions.get(payment.displayOrderId);
+            if (s) {
+                clearInterval(s.pollingId);
+                clearTimeout(s.timeoutId);
+                paymentSessions.delete(payment.displayOrderId);
+            }
+        };
+
+        // Pembayaran terdeteksi -> kirim akun (fungsi ini juga menghapus QR).
+        // Kalau order keburu ditandai kedaluwarsa (bayar di detik terakhir),
+        // diproses sebagai pembayaran telat.
+        const onPaid = async () => {
+            try {
+                const r = await fulfillAutoGoPayPaidOrder(payment.displayOrderId);
+                if (!r.ok && r.reason === 'not_pending') await settleAutoGoPay({ orderId: payment.displayOrderId });
+            } finally {
+                // Walau terjadi error DB, timer dihentikan & sesi dilepas -> sweeper 2 menitan
+                // yang akan mencoba lagi (order tidak "nyangkut" dipantau polling mati).
+                finish();
+                await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
+            }
+        };
+
+        const handleExpiry = async () => {
+            if (isHandled) return;
+            isHandled = true;
+            finish();
+            // Cek terakhir ke AutoGoPay: jangan batalkan order yang ternyata sudah dibayar.
+            const finalStatus = await autogopayStatusOf(payment.txnId, payment.totalBayar);
+            if (finalStatus === 'completed') { await onPaid(); return; }
+            if (!['expired', 'cancelled'].includes(finalStatus)) return; // sweeper retries safely
+            const expired = await expireAutoGoPayOrder(payment.displayOrderId, finalStatus);
+            if (!expired) return; // sudah dibayar / diproses
+            await bot.telegram.deleteMessage(ctx.chat.id, qrPhotoMsg.message_id).catch(() => {});
+            await gmailcheck.dropResult(bot.telegram, ctx.chat.id, gmailPre.resultMsgId);
+            await bot.telegram.sendMessage(ctx.from.id, `📜 *Tagihan Kadaluarsa*\n\nTagihan untuk ID \`${payment.displayOrderId}\` telah kadaluarsa.\nJika Anda terlanjur membayar, tenang — akun tetap dikirim otomatis begitu pembayaran terdeteksi.`, { parse_mode: 'Markdown' }).catch(() => {});
+        };
+
+        const pollOnce = async () => {
+            if (isHandled || polling) return;
+            if (Date.now() - startedAt > pollDuration) { await handleExpiry(); return; }
+            polling = true;
+            try {
+                if (await autogopayStatusOf(payment.txnId, payment.totalBayar) === 'completed') {
+                    // Tetap diproses walau timer kedaluwarsa jalan bersamaan: fungsi pemenuhan
+                    // bersifat atomik, jadi akun tidak mungkin terkirim dua kali.
+                    isHandled = true;
+                    await onPaid();
+                }
+            } catch (e) {
+                console.error('[AUTOGOPAY] poll error:', e.message);
+            } finally {
+                polling = false;
+            }
+        };
+
+        const pollingId = setInterval(() => pollOnce().catch(e => console.error('[AUTOGOPAY] Poll:', e.message)), pollInterval);
+        const timeoutId = setTimeout(() => handleExpiry().catch(e => console.error('[AUTOGOPAY] Expiry:', e.message)), pollDuration);
+        paymentSessions.set(payment.displayOrderId, {
+            pollingId, timeoutId,
+            qrPhotoMsgId: qrPhotoMsg.message_id,
+            gmailResultMsgId: gmailPre.resultMsgId, // pesan "Pengecekan Otomatis Selesai" (kalau ada)
+            chatId: ctx.chat.id,
+            userId: ctx.from.id,
+        });
+
+    } catch (error) {
+        console.error('[AUTOGOPAY] Invoice error:', error.message);
+        if (!transactionCommitted) {
+            await session.abortTransaction().catch(() => {});
+        } else {
+            // Keep the reservation on ambiguous generate/display failures. Never auto-generate again.
+            // A generated invoice with a saved ID is reconciled by the sweeper.
+            await agpSafety.flagReview(internalOrderId, 'Invoice gagal dibuat/ditampilkan; cocokkan dashboard sebelum membuka gate.').catch(() => {});
+            await ctx.reply(`Invoice ${internalOrderId} perlu diperiksa. Jangan membuat QRIS ulang; hubungi admin bila QRIS belum tampil.`).catch(() => {});
+        }
+        gmailcheck.release(gmailPre.preferred); // lepas akun Gmail yang tadi ditahan untuk pembeli ini
+        await gmailcheck.dropResult(ctx.telegram, ctx.chat.id, gmailPre.resultMsgId); // hapus "hasil pengecekan" (QRIS gagal dibuat)
+        const stokHabis = !!(error && error.message === 'Maaf, stok tidak mencukupi.');
+        if (workingMsg) await ctx.deleteMessage(workingMsg.message_id).catch(() => {});
+        await ctx.reply(stokHabis
+            ? '❌ Maaf, stok tidak mencukupi (baru saja habis dibeli). Silakan kurangi jumlah atau coba lagi nanti.'
+            : transactionCommitted ? '⚠️ Invoice sedang diperiksa. Hubungi admin dan jangan membuat pembayaran baru.' : '❌ Invoice belum dapat dibuat. Hubungi admin.').catch(() => {});
+        if (!stokHabis) {
+            const detail = (error && error.message) ? error.message : String(error);
+            for (const ownerId of ownerIdList()) {
+                await bot.telegram.sendMessage(ownerId, `⚠️ [AUTOGOPAY] Order ${internalOrderId}:\n${detail}\nCek dashboard AutoGoPay. Bila ID transaksi belum tersimpan, cocokkan transaksi sebelum melepas reservasi stok.`).catch(() => {});
+            }
+        }
+    } finally {
+        session.endSession();
+    }
+    } finally {
+        autogopayCreating.delete(buyerId);
+    }
+});
+
+
 bot.action(/^pakasir_([^_]+)_(.*?)_(\d+)$/, async (ctx) => {
     let workingMsg, qrPhotoMsg;
     const productId = ctx.match[1];
@@ -2604,7 +2899,7 @@ async function recordAlimSale(body) {
 async function fulfillPakasirPaidOrder(orderId) {
     // Idempoten: hanya proses order yang MASIH PENDING (aman thd polling + webhook + sweeper).
     const order = await Order.findOneAndUpdate(
-        { orderId: orderId, status: 'PENDING' },
+        { orderId: orderId, status: 'PENDING', paymentGateway: 'pakasir' },
         { $set: { status: 'PAID', paidAt: new Date() }, $unset: { expiresAt: "" } },
         { new: true }
     );
@@ -2638,6 +2933,25 @@ async function fulfillPakasirPaidOrder(orderId) {
     return { ok: true };
 }
 
+async function fulfillAutoGoPayPaidOrder(orderId) {
+    const order = await agpSafety.settle(orderId);
+    const active = paymentSessions.get(orderId);
+    if (active) { clearInterval(active.pollingId); clearTimeout(active.timeoutId); paymentSessions.delete(orderId); }
+    if (order.qrMsgId) await bot.telegram.deleteMessage(order.customerInfo.telegramUserId, order.qrMsgId).catch(() => {});
+    await deliverAutoGoPay(order);
+    return { ok: true };
+}
+async function expireAutoGoPayOrder(orderId, terminalStatus) {
+    const expired = await agpSafety.expire(orderId, terminalStatus);
+    if (expired) {
+        const order = await Order.findOne({ orderId }).lean();
+        const active = paymentSessions.get(orderId);
+        if (active) { clearInterval(active.pollingId); clearTimeout(active.timeoutId); paymentSessions.delete(orderId); }
+        if (order && order.qrMsgId) await bot.telegram.deleteMessage(order.customerInfo.telegramUserId, order.qrMsgId).catch(() => {});
+    }
+    return expired;
+}
+
 // =================================================================
 // PEMBAYARAN TELAT / RESTART (Pakasir)
 // QRIS Pakasir v2 tetap bisa dibayar sampai ±24 jam walau invoice di bot sudah
@@ -2663,7 +2977,7 @@ async function pakasirStatusOf(txnId) {
 // PENDING -> EXPIRED secara atomik, BARU stok dikembalikan (tidak mungkin dobel).
 async function expirePakasirOrder(orderId) {
     const order = await Order.findOneAndUpdate(
-        { orderId, status: 'PENDING' },
+        { orderId, status: 'PENDING', paymentGateway: { $ne: 'autogopay' } },
         { $set: { status: 'EXPIRED' } },
         { new: true }
     );
@@ -2896,7 +3210,7 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
         const session = await mongoose.startSession();
         session.startTransaction();
         try {
-            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING', paymentGateway: { $ne: 'autogopay' }, 'customerInfo.telegramUserId': String(ctx.from.id) }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
             if (!order) {
                 await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
                 await session.abortTransaction().catch(() => {});
@@ -2919,6 +3233,69 @@ bot.action(/^cancel_payment_pakasir_(.*)$/, async (ctx) => {
         console.error('Error in cancel_payment_pakasir:', error);
         await ctx.reply('❌ Terjadi kesalahan saat memproses pembatalan.');
     }
+});
+
+// AutoGoPay status is authenticated by the API; never trust webhook status alone.
+async function autogopayStatusOf(txnId, expectedAmount) {
+    if (!txnId) return null;
+    try {
+        const result = await autogopay.checkPaymentStatus(txnId);
+        if (result.amount !== undefined && Number(result.amount) !== Number(expectedAmount)) return null;
+        return result.status;
+    } catch (_) { return null; }
+}
+async function settleAutoGoPay(order) {
+    const result = await fulfillAutoGoPayPaidOrder(order.orderId);
+    return result;
+}
+let autogopaySweeping = false;
+async function sweepAutoGoPayOrders() {
+    if (autogopaySweeping || !agpReady || !process.env.AUTOGOPAY_API_KEY) return;
+    autogopaySweeping = true;
+    try {
+        await agpDelivery.recover();
+        const orders = await Order.find({ paymentGateway: 'autogopay',
+            autogopayTxnId: { $type: 'string' },
+            status: { $in: ['PENDING', 'EXPIRED', 'CANCELLED', 'FAILED'] },
+            $or: [{ autogopayCheckedAt: { $exists: false } },
+                { autogopayCheckedAt: { $lt: new Date(Date.now() - 60000) } }],
+        }).sort({ autogopayCheckedAt: 1 }).limit(25).lean();
+        for (const order of orders) {
+            if (paymentSessions.has(order.orderId)) continue;
+            const status = await autogopayStatusOf(order.autogopayTxnId, order.totalPaid || order.amount);
+            await Order.updateOne({ _id: order._id }, { $set: { autogopayCheckedAt: new Date() } });
+            if (status === 'completed') await settleAutoGoPay(order);
+            else if (['expired', 'cancelled'].includes(status) && order.status === 'PENDING') {
+                await expireAutoGoPayOrder(order.orderId, status);
+            }
+        }
+    } catch (error) { console.error('[AUTOGOPAY] Reconcile:', error.message); }
+    finally { autogopaySweeping = false; }
+}
+app.post('/autogopay/callback', async (req, res) => {
+    if (!agpReady) return res.status(503).json({ success: false });
+    if (!autogopay.verifySignature(req.rawBody, req.headers['x-signature'])) {
+        return res.status(401).json({ success: false });
+    }
+    const body = req.body || {};
+    const tx = body.transaction;
+    if (body.event !== 'transaction.received' || !tx || tx.status !== 'PAID' || tx.payment_method !== 'QRIS') {
+        return res.status(400).json({ success: false });
+    }
+    try {
+        const order = await Order.findOne({ paymentGateway: 'autogopay',
+            autogopayTxnId: String(tx.transaction_id || '') }).lean();
+        if (!order) return res.status(404).json({ success: false });
+        if (order.depositId !== tx.order_id || Number(tx.amount) !== Number(order.totalPaid || order.amount)) {
+            return res.status(400).json({ success: false });
+        }
+        if (await autogopayStatusOf(order.autogopayTxnId, order.totalPaid || order.amount) !== 'completed') {
+            return res.status(503).json({ success: false });
+        }
+        // Reply promptly. The persistent order is reconciled by the sweeper on a process crash.
+        res.json({ success: true });
+        settleAutoGoPay(order).catch(error => console.error('[AUTOGOPAY] Fulfillment:', error.message));
+    } catch (_) { return res.status(503).json({ success: false }); }
 });
 
 // ===== Webhook / Callback QRIN =====
@@ -3008,6 +3385,8 @@ app.post(['/callback', '/qrin/callback', '/pakasir/callback'], async (req, res) 
             }
 
             if (status === 'completed') {
+                const target = await Order.findOne({ orderId }).lean();
+                if (target && target.paymentGateway !== 'pakasir') return res.status(400).json({ success: false });
                 // X-Secret sudah lolos; verifikasi ulang status ke Pakasir (pakai txn_id)
                 // sebagai lapis kedua bila txn_id tersedia.
                 let verified = true;
@@ -3090,7 +3469,7 @@ bot.action(/^cancel_payment_tokopay_(.*)$/, async (ctx) => {
         const session = await mongoose.startSession();
         session.startTransaction();
         try {
-            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING', paymentGateway: { $ne: 'autogopay' }, 'customerInfo.telegramUserId': String(ctx.from.id) }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
             if (!order) {
                 await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
                 await session.abortTransaction();
@@ -3133,7 +3512,7 @@ bot.action(/^cancel_payment_dana_(.*)$/, async (ctx) => {
         const session = await mongoose.startSession();
         session.startTransaction();
         try {
-            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING', paymentGateway: { $ne: 'autogopay' }, 'customerInfo.telegramUserId': String(ctx.from.id) }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
             if (!order) {
                 await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
                 await session.abortTransaction();
@@ -3177,7 +3556,7 @@ bot.action(/^cancel_payment_qrin_(.*)$/, async (ctx) => {
         const session = await mongoose.startSession();
         session.startTransaction();
         try {
-            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING', paymentGateway: { $ne: 'autogopay' }, 'customerInfo.telegramUserId': String(ctx.from.id) }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
             if (!order) {
                 await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
                 await session.abortTransaction();
@@ -3202,6 +3581,31 @@ bot.action(/^cancel_payment_qrin_(.*)$/, async (ctx) => {
     }
 });
 
+bot.action(/^cancel_payment_autogopay_(.*)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const order = await Order.findOne({ orderId: ctx.match[1], paymentGateway: 'autogopay',
+        'customerInfo.telegramUserId': String(ctx.from.id) }).lean();
+    if (!order) return ctx.reply('Pesanan tidak ditemukan.');
+    if (order.status === 'PAID') {
+        await settleAutoGoPay(order);
+        return ctx.reply('Pembayaran sudah diterima; pesanan tidak dibatalkan.');
+    }
+    try {
+        const status = await autogopayStatusOf(order.autogopayTxnId, order.totalPaid || order.amount);
+        if (status === 'completed') { await settleAutoGoPay(order); return; }
+        if (status === 'pending') await autogopay.cancelTransaction(order.autogopayTxnId);
+        const confirmed = await autogopayStatusOf(order.autogopayTxnId, order.totalPaid || order.amount);
+        if (confirmed === 'completed') { await settleAutoGoPay(order); return; }
+        if (!['expired', 'cancelled'].includes(confirmed)) {
+            return ctx.reply('Pembatalan belum terkonfirmasi. Invoice tetap dipantau, mohon tunggu.');
+        }
+        await expireAutoGoPayOrder(order.orderId, confirmed);
+        const active = paymentSessions.get(order.orderId);
+        if (active) { clearInterval(active.pollingId); clearTimeout(active.timeoutId); paymentSessions.delete(order.orderId); }
+        await ctx.reply('Pembayaran dibatalkan.');
+    } catch (_) { await ctx.reply('Status pembayaran belum dapat dipastikan. Invoice tetap dipantau.'); }
+});
+
 bot.action(/^cancel_payment_(.*)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
@@ -3218,7 +3622,7 @@ bot.action(/^cancel_payment_(.*)$/, async (ctx) => {
         const session = await mongoose.startSession();
         session.startTransaction();
         try {
-            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING' }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
+            const order = await Order.findOneAndUpdate({ orderId: orderId, status: 'PENDING', paymentGateway: { $ne: 'autogopay' }, 'customerInfo.telegramUserId': String(ctx.from.id) }, { $set: { status: 'CANCELLED', cancelledAt: new Date() } }, { new: true, session: session });
             if (!order) {
                 await ctx.reply('Pesanan tidak ditemukan atau sudah diproses.');
                 await session.abortTransaction();
@@ -4143,7 +4547,7 @@ app.listen(PORT, () => {
 });
 
 // Jalankan Telegram Bot
-bot.launch().then(() => {
+databaseReady.then(() => bot.launch()).then(() => {
     console.log('✅ Bot Telegram berhasil terhubung dan berjalan...');
 }).catch(err => {
     console.error('❌ Error saat menjalankan bot:', err);
@@ -4161,8 +4565,8 @@ if (ADMIN_DEFAULT_LOGIN) {
     setTimeout(() => {
         for (const id of ownerIdList()) {
             bot.telegram.sendMessage(id,
-                '⚠️ Login panel web masih memakai gen/gen (tidak aman).\n' +
-                'Isi ADMIN_USERNAME dan ADMIN_PASSWORD di Environment Render, lalu deploy ulang.'
+                '⚠️ Login panel web dinonaktifkan sampai kredensial aman diatur.\n' +
+                'Isi ADMIN_USERNAME dan ADMIN_PASSWORD minimal 12 karakter di Environment Render, lalu deploy ulang.'
             ).catch(() => {});
         }
     }, 25 * 1000);
@@ -4205,3 +4609,32 @@ process.on('uncaughtException', (err) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+
+// Merchant controls: no command resets counters or cancels an uncertain invoice.
+bot.command('agpstatus', async ctx => {
+    if (!ownerIdList().includes(String(ctx.from.id))) return;
+    const settings = await Settings.findOne({ identifier: 'global-settings' }).lean() || {};
+    const pending = await Order.countDocuments({ paymentGateway: 'autogopay', status: 'PENDING' });
+    await ctx.reply(`AutoGoPay\nSiap: ${agpReady}\nCircuit dihentikan: ${!!settings.autogopayCircuitOpen}\nInvoice aktif: ${settings.autogopayActiveOrder || '-'}\nPending: ${pending}\nJeda berikutnya: ${settings.autogopayNextGenerateAt || '-'}\nBatas bot: 1 invoice aktif, 60 detik, 20/jam, 100/hari.`);
+});
+bot.command('agplanjut', async ctx => {
+    if (!ownerIdList().includes(String(ctx.from.id))) return;
+    const session = await mongoose.startSession();
+    let resumed = false;
+    try {
+        await session.withTransaction(async () => {
+            resumed = false;
+            const pending = await Order.findOne({ paymentGateway: 'autogopay', status: 'PENDING' }).session(session);
+            const settings = await Settings.findOne({ identifier: 'global-settings' }).session(session);
+            if (pending || settings?.autogopayActiveOrder) return;
+            if (settings) { settings.autogopayCircuitOpen = false; await settings.save({ session }); }
+            resumed = true;
+        });
+        await ctx.reply(resumed ? 'Pembuatan QRIS diaktifkan kembali; seluruh kuota/jeda tetap berlaku.' : 'Masih ada invoice yang belum jelas. Cocokkan dengan dashboard dahulu; bot tidak akan melepas stok tanpa konfirmasi.');
+    } finally { await session.endSession(); }
+});
+
+// Restart recovery for AutoGoPay invoices, including failures while sending the QR image.
+setTimeout(sweepAutoGoPayOrders, 25 * 1000);
+setInterval(sweepAutoGoPayOrders, 60 * 1000);

@@ -54,6 +54,24 @@ const OrderSchema = new mongoose.Schema({
     depositId: String,
     // Pakasir API v2: txn_id transaksi. Dipakai untuk cek status & rekonsiliasi.
     pakasirTxnId: String,
+    autogopayTxnId: String,
+    autogopayExpiresAt: Date,
+    autogopayQrString: String,
+    invoiceRedisplayAt: Date,
+    autogopayCheckedAt: Date,
+    activeBuyerKey: String,
+    reservationAudit: [String],
+    inventoryState: { type: String, enum: ['HELD', 'RELEASED', 'SOLD', 'REVIEW'] },
+    paymentReviewReason: String,
+    paymentReviewAt: Date,
+    providerTerminalAt: Date,
+    deliveryState: { type: String, enum: ['READY', 'SENDING', 'RETRY', 'DELIVERED', 'REVIEW'] },
+    deliveryStartedAt: Date,
+    deliveryRetryAt: Date,
+    deliveryAttempts: { type: Number, default: 0 },
+    deliveryReviewReason: String,
+    deliveryMessageId: Number,
+    reviewNotifiedAt: Date,
     amount: Number,
     // Rincian bayar (dipakai struk testimoni): biaya QRIS & total yang dibayar customer.
     fee: Number,
@@ -98,6 +116,13 @@ const OrderSchema = new mongoose.Schema({
 const SettingsSchema = new mongoose.Schema({
     // Dibuat unik agar hanya ada satu dokumen pengaturan
     identifier: { type: String, default: 'global-settings', unique: true }, 
+    autogopayActiveOrder: String,
+    autogopayNextGenerateAt: Date,
+    autogopayCircuitOpen: { type: Boolean, default: false },
+    autogopayHour: Number,
+    autogopayHourCount: Number,
+    autogopayDay: Number,
+    autogopayDayCount: Number,
     linkqu_enabled: { type: Boolean, default: true },
     dana_enabled: { type: Boolean, default: true },
     tokopay_enabled: { type: Boolean, default: true },
@@ -126,6 +151,10 @@ OrderSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_expiresA
 
 // Dipakai fitur 'Riwayat Transaksi' (sebelumnya collection scan tiap ditekan).
 OrderSchema.index({ 'customerInfo.telegramUserId': 1, status: 1 });
+OrderSchema.index({ activeBuyerKey: 1 }, { unique: true,
+    partialFilterExpression: { activeBuyerKey: { $type: 'string' } } });
+OrderSchema.index({ autogopayTxnId: 1 }, { unique: true,
+    partialFilterExpression: { autogopayTxnId: { $type: 'string' } } });
 // Dipakai sweeper Pakasir (cek ulang order 24 jam terakhir).
 OrderSchema.index({ paymentGateway: 1, status: 1, createdAt: -1 });
 

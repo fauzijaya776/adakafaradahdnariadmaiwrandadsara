@@ -171,6 +171,7 @@ async function recoverStrandedStock() {
     const strandedCutoff = new Date(Date.now() - 60 * 60 * 1000);
     const stranded = await Order.find({
         status: 'PENDING',
+        paymentGateway: { $ne: 'autogopay' },
         createdAt: { $lt: strandedCutoff },
         reservedItems: { $exists: true, $ne: [] }
     }).lean();
@@ -214,7 +215,7 @@ async function cleanOrders() {
     line();
 
     const junkCutoff = new Date(Date.now() - JUNK_ORDER_TTL_HOURS * 60 * 60 * 1000);
-    const junkFilter = { status: { $ne: 'PAID' }, createdAt: { $lt: junkCutoff } };
+    const junkFilter = { paymentGateway: { $ne: 'autogopay' }, status: { $ne: 'PAID' }, createdAt: { $lt: junkCutoff } };
     const junkCount = await Order.countDocuments(junkFilter);
 
     console.log(`1. Order TIDAK LUNAS lebih tua dari ${JUNK_ORDER_TTL_HOURS} jam`);
@@ -239,6 +240,7 @@ async function cleanOrders() {
     const stripCutoff = new Date(Date.now() - PAID_ITEMS_RETENTION_DAYS * 24 * 60 * 60 * 1000);
     const stripFilter = {
         status: 'PAID',
+        delivered: true,
         createdAt: { $lt: stripCutoff },
         $or: [
             { reservedItems: { $exists: true, $ne: [] } },
@@ -254,7 +256,7 @@ async function cleanOrders() {
     if (stripCount > 0) {
         if (APPLY) {
             const result = await Order.updateMany(stripFilter, {
-                $set: { reservedItems: [] },
+                $set: { reservedItems: [], reservationAudit: [] },
                 $unset: { paymentDetails: '' }
             });
             console.log(`   -> ${result.modifiedCount} dokumen DIRINGKAS.`);
@@ -286,12 +288,13 @@ async function cleanOrders() {
     // mengurusnya sendiri ke depannya.
     const needTtl = await Order.countDocuments({
         status: { $ne: 'PAID' },
+        paymentGateway: { $ne: 'autogopay' },
         expiresAt: { $exists: false }
     });
     console.log(`4. Order tidak lunas tanpa expiresAt: ${needTtl}`);
     if (needTtl > 0 && APPLY) {
         const result = await Order.updateMany(
-            { status: { $ne: 'PAID' }, expiresAt: { $exists: false } },
+            { status: { $ne: 'PAID' }, paymentGateway: { $ne: 'autogopay' }, expiresAt: { $exists: false } },
             { $set: { expiresAt: new Date(Date.now() + JUNK_ORDER_TTL_HOURS * 60 * 60 * 1000) } }
         );
         console.log(`   -> ${result.modifiedCount} dokumen dijadwalkan kedaluwarsa.`);
@@ -385,3 +388,4 @@ main().catch(async (error) => {
     try { await mongoose.connection.close(); } catch (e) {}
     process.exit(1);
 });
+

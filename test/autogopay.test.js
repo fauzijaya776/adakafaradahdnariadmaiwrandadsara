@@ -69,11 +69,25 @@ test('webhook HMAC verifies exact raw bytes, and rejects invalid or missing sign
     for (const value of [undefined, '', 'x', '0'.repeat(64)]) assert.equal(api.verifySignature(raw,value),false);
     assert.equal(api.verifySignature(Buffer.from('{"amount":10000}'), sign), false);
 });
-test('expiry parses timezone-less WIB timestamps independently of server timezone', () => {
+test('expiry: API AutoGoPay memakai UTC+8 (bukan WIB seperti di dokumentasi)', () => {
+    const { api } = load(null);
+    // Nilai nyata: invoice dibuat 10:43 UTC, expiry_time dikirim dalam UTC+8 → 18:58:00.
+    const now = Date.parse('2026-10-30T10:43:00Z');
+    assert.equal(api.expiryDate('2026-10-30 18:58:00', now).toISOString(), '2026-10-30T10:58:00.000Z');
+    assert.equal(api.expiryDate('2026-10-30T18:58:00', now).toISOString(), '2026-10-30T10:58:00.000Z');
+});
+test('expiry: format WIB (sesuai dokumentasi) tetap diterima', () => {
     const { api } = load(null);
     const now = Date.parse('2026-10-30T09:00:00Z');
     assert.equal(api.expiryDate('2026-10-30 16:15:00', now).toISOString(), '2026-10-30T09:15:00.000Z');
-    for (const value of ['', 'invalid', '2026-10-30 15:00:00']) assert.throws(() => api.expiryDate(value, now));
+    assert.equal(api.expiryDate('2026-10-30T09:15:00Z', now).toISOString(), '2026-10-30T09:15:00.000Z');
+});
+test('expiry tidak wajar/kosong tidak menggagalkan invoice yang sudah dibuat: pakai 15 menit', () => {
+    const { api } = load(null);
+    const now = Date.parse('2026-10-30T09:00:00Z');
+    for (const value of [undefined, '', 'invalid', '2026-10-30 15:00:00', '2026-10-31 16:15:00']) {
+        assert.equal(api.expiryDate(value, now).toISOString(), '2026-10-30T09:15:00.000Z', String(value));
+    }
 });
 
 // Execute actual payment functions without starting Telegram, Express or MongoDB.
@@ -101,10 +115,24 @@ test('sweeper keeps reservations on pending/outage and reconciles settled invoic
     value='expired'; await context.sweepAutoGoPayOrders(); assert.equal(expired,1);
 });
 
-test('provider identity is persisted before expiry validation fails, enabling reconciliation',async()=>{
+test('expiry tidak wajar tidak membatalkan invoice: identitas tersimpan dan QRIS tetap ditampilkan (15 menit)',async()=>{
     const data=invoice();data.data.expiry_time='malformed';const {api}=load(data);let identity;
-    await assert.rejects(api.createTransaction('local',10000,async value=>{identity=value;}));
+    const before=Date.now();
+    const tx=await api.createTransaction('local',10000,async value=>{identity=value;});
     assert.equal(identity.txnId,'tx-1');assert.equal(identity.realOrderId,'agp-1');
+    const ms=tx.expiresAt.getTime()-before;assert.ok(ms>=15*60000-1000&&ms<=15*60000+5000,String(ms));
+});
+test('status belum lunas dikirim dengan success:false; tetap terbaca (pending/expire/cancel)', async () => {
+    for (const [raw, want] of [['pending', 'pending'], ['expire', 'expired'], ['cancel', 'cancelled'], ['', 'unknown']]) {
+        const { api } = load({ success: false, message: 'Transaction status: ' + raw,
+            data: { transaction_id: raw ? 'tx-1' : '', transaction_status: raw, transaction_time: raw ? '2026-10-30 18:43:10' : '' } });
+        assert.equal((await api.checkPaymentStatus('tx-1')).status, want, raw);
+    }
+    // settlement tetap success:true
+    const { api } = load({ success: true, message: 'Transaction successful', data: { transaction_id: 'tx-1', transaction_status: 'settlement' } });
+    assert.equal((await api.checkPaymentStatus('tx-1')).status, 'completed');
+    // generate dengan success:false tetap ditolak
+    await assert.rejects(load({ success: false, message: 'x', data: { transaction_status: '' } }).api.createTransaction('local', 10000));
 });
 test('parallel status reads share one network request',async()=>{
     const {api,calls}=load({success:true,data:{transaction_status:'pending'}});

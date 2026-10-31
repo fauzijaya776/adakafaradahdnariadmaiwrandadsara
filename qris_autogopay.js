@@ -11,7 +11,7 @@ function apiKey() {
     if (!key) throw new Error('AUTOGOPAY_API_KEY belum diatur di environment server.');
     return key;
 }
-async function request(path, body, timeout = 20000) {
+async function request(path, body, timeout = 20000, { statusEnvelope = false } = {}) {
     if (Date.now() < backoffUntil) throw new Error('AutoGoPay sedang dalam jeda pemulihan; jangan membuat ulang QRIS.');
     let response;
     try {
@@ -28,6 +28,13 @@ async function request(path, body, timeout = 20000) {
         throw new Error('AutoGoPay tidak dapat dihubungi. Cek dashboard sebelum membuat QRIS lagi.');
     }
     const envelope = response.data;
+    // /qris/status membalas success:false untuk SEMUA transaksi yang belum lunas, mis.
+    // {"success":false,"message":"Transaction status: expire","data":{"transaction_status":"expire",...}}.
+    // Hanya settlement yang success:true. Jadi untuk cek status, data.transaction_status yang dibaca;
+    // kalau ini ditolak, status pending/expire tidak pernah terlihat dan order tertahan selamanya.
+    if (statusEnvelope && envelope && envelope.data && typeof envelope.data.transaction_status === 'string') {
+        return envelope.data;
+    }
     if (!envelope || envelope.success !== true || !envelope.data) {
         throw new Error('AutoGoPay menolak request. Cek koneksi merchant/langganan di dashboard.');
     }
@@ -39,16 +46,24 @@ function normalizeStatus(data) {
         expire: 'expired', expired: 'expired', cancel: 'cancelled', cancelled: 'cancelled',
         pending: 'pending' })[status] || 'unknown';
 }
+const QR_LIFETIME_MS = 15 * 60 * 1000;
+const MAX_EXPIRY_MS = 20 * 60 * 1000;
 function expiryDate(value, now = Date.now()) {
-    // API timestamps are WIB, not the timezone of the hosting server.
-    const text = String(value || '');
-    const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)
-        ? text.replace(' ', 'T') + '+07:00' : text;
-    const time = Date.parse(iso);
-    if (!Number.isFinite(time) || time <= now || time > now + 20 * 60 * 1000) {
-        throw new Error('AutoGoPay mengembalikan waktu kedaluwarsa tidak valid. Cek dashboard.');
+    // Dokumentasi menyebut WIB, tetapi API /qris/* nyatanya memakai UTC+8: transaksi yang sama
+    // tercatat 16:01:37 di /transactions (WIB) dan 17:01:37 di /qris/status. Jadi stempel waktu
+    // tanpa zona dicoba sebagai +08:00 lalu +07:00; yang jatuh dalam jendela wajar QRIS dipakai.
+    // Kalau tidak ada yang cocok, JANGAN gagal: invoice sudah terbuat di provider, jadi gagal di sini
+    // hanya membuat QRIS tidak tampil dan order tertahan. Pakai umur standar 15 menit; status
+    // sebenarnya tetap diverifikasi ke API (polling + sweeper) sebelum stok dilepas.
+    const text = String(value || '').trim();
+    const local = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(text);
+    const candidates = local ? ['+08:00', '+07:00'].map(z => text.replace(' ', 'T') + z) : [text];
+    for (const iso of candidates) {
+        const time = Date.parse(iso);
+        if (Number.isFinite(time) && time > now && time <= now + MAX_EXPIRY_MS) return new Date(time);
     }
-    return new Date(time);
+    console.warn('[AUTOGOPAY] expiry_time tidak wajar, memakai 15 menit:', JSON.stringify(value));
+    return new Date(now + QR_LIFETIME_MS);
 }
 async function createTransaction(orderId, amount, onCreated) {
     if (!Number.isSafeInteger(amount) || amount < 1 || amount > 10000000) {
@@ -74,7 +89,7 @@ async function createTransaction(orderId, amount, onCreated) {
 }
 async function fetchPaymentStatus(txnId) {
     if (!txnId) throw new Error('ID transaksi AutoGoPay tidak tersedia.');
-    const data = await request('/qris/status', { transaction_id: txnId }, 6000);
+    const data = await request('/qris/status', { transaction_id: txnId }, 6000, { statusEnvelope: true });
     // Some status responses omit the ID; an explicitly different ID is never accepted.
     if (data.transaction_id && String(data.transaction_id) !== String(txnId)) {
         throw new Error('ID transaksi AutoGoPay tidak cocok.');

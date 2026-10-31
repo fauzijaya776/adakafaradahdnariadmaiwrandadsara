@@ -24,6 +24,7 @@ const axios = require('axios');
 const mongoose = require('mongoose');
 const moment = require('moment-timezone');
 const pakasir = require('./qris_pakasir');
+const autogopay = require('./qris_autogopay');
 const { AlimSale, Settings } = require('./db');
 
 const SYNC_DAYS = Math.max(1, parseInt(process.env.ALIM_SYNC_DAYS, 10) || 3);
@@ -161,12 +162,45 @@ async function upsertAlimSale({ orderId, txnId, amount, completedAt, via }) {
     }
 }
 
-// Cek satu order ke Pakasir lalu catat bila benar-benar lunas.
+// Order Alim yang dibayar lewat AutoGoPay (akun AutoGoPay FZI):
+//   * bot ALIM menyimpan ID transaksinya di pakasirTxnId dengan awalan "agp:";
+//   * website Alim melaporkan gateway "autogopay" (ID tanpa awalan) di feed.
+// Order seperti ini diverifikasi ke AutoGoPay, bukan ke Pakasir.
+function isAutoGoPay(doc, txnId) {
+    return String(txnId || '').startsWith('agp:') || String(doc.paymentGateway || '').toLowerCase() === 'autogopay';
+}
+
+async function verifyAutoGoPay(doc, orderId, txnId) {
+    const id = String(txnId).replace(/^agp:/, '');
+    let detail;
+    try {
+        detail = await autogopay.checkPaymentStatus(id);
+    } catch (e) {
+        return { status: 'check_failed', reason: `gagal cek ke AutoGoPay: ${e.message}` };
+    }
+    if (detail.status !== 'completed') {
+        return { status: detail.status === 'pending' ? 'pending' : 'rejected', reason: `status AutoGoPay ${detail.status || '-'}` };
+    }
+    // QRIS dinamis dibuat dengan nominal order; status AutoGoPay biasanya tanpa nominal.
+    const amount = Number(detail.amount) > 0 ? Number(detail.amount) : (Number(doc.amount) || 0);
+    if (doc.amount != null && Number(detail.amount) > 0 && Number(detail.amount) !== Number(doc.amount)) {
+        return { status: 'rejected', reason: `nominal AutoGoPay (${detail.amount}) beda dengan order (${doc.amount})` };
+    }
+    if (amount <= 0) return { status: 'rejected', reason: 'nominal kosong' };
+    const r = await upsertAlimSale({
+        orderId, txnId: 'agp:' + id, amount, via: 'sync',
+        completedAt: doc.paidAt || doc.createdAt,
+    });
+    return r.recorded ? { status: 'recorded', amount } : { status: 'already', reason: r.reason };
+}
+
+// Cek satu order ke gateway pembayarnya (Pakasir / AutoGoPay) lalu catat bila benar-benar lunas.
 // status: recorded | already | no_txn | check_failed | pending | rejected
 async function verifyAndRecord(doc) {
     const orderId = String(doc.orderId);
     const txnId = txnOf(doc);
-    if (!txnId) return { status: 'no_txn', reason: 'tidak ada txn_id Pakasir di database Alim' };
+    if (!txnId) return { status: 'no_txn', reason: 'tidak ada ID transaksi di database Alim' };
+    if (isAutoGoPay(doc, txnId)) return verifyAutoGoPay(doc, orderId, txnId);
 
     const detail = await pakasir.checkPaymentStatus(txnId);
     if (!detail) return { status: 'check_failed', reason: 'gagal cek ke Pakasir (jaringan / rate limit)' };
@@ -224,13 +258,13 @@ async function runSync() {
     for (const doc of todo) {
         const orderId = String(doc.orderId);
         if (!txnOf(doc)) {
-            // Order non-Pakasir (mis. bayar saldo) memang tidak masuk akun Pakasir -> diam saja.
-            if (!doc.paymentGateway || String(doc.paymentGateway).toLowerCase() === 'pakasir') summary.noTxn.push(orderId);
+            // Order non-QRIS (mis. bayar saldo) memang tidak masuk akun Pakasir/AutoGoPay -> diam saja.
+            if (!doc.paymentGateway || ['pakasir', 'autogopay'].includes(String(doc.paymentGateway).toLowerCase())) summary.noTxn.push(orderId);
             continue;
         }
         if (checks >= MAX_CHECKS_PER_RUN) { summary.deferred += 1; continue; }
         checks += 1;
-        if (checks > 1) await sleep(300); // jangan membanjiri API Pakasir
+        if (checks > 1) await sleep(300); // jangan membanjiri API gateway
 
         let r;
         try {
@@ -329,6 +363,7 @@ async function alimSyncStatus() {
 }
 
 module.exports = {
+    verifyAndRecord, // dipakai tes
     parsePaidAt,
     isEnabled,
     syncAlimSales,

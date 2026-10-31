@@ -11,7 +11,7 @@ function apiKey() {
     if (!key) throw new Error('AUTOGOPAY_API_KEY belum diatur di environment server.');
     return key;
 }
-async function request(path, body, timeout = 20000) {
+async function request(path, body, timeout = 20000, { statusEnvelope = false } = {}) {
     if (Date.now() < backoffUntil) throw new Error('AutoGoPay sedang dalam jeda pemulihan; jangan membuat ulang QRIS.');
     let response;
     try {
@@ -28,6 +28,13 @@ async function request(path, body, timeout = 20000) {
         throw new Error('AutoGoPay tidak dapat dihubungi. Cek dashboard sebelum membuat QRIS lagi.');
     }
     const envelope = response.data;
+    // /qris/status membalas success:false untuk SEMUA transaksi yang belum lunas, mis.
+    // {"success":false,"message":"Transaction status: expire","data":{"transaction_status":"expire",...}}.
+    // Hanya settlement yang success:true. Jadi untuk cek status, data.transaction_status yang dibaca;
+    // kalau ini ditolak, status pending/expire tidak pernah terlihat dan order tertahan selamanya.
+    if (statusEnvelope && envelope && envelope.data && typeof envelope.data.transaction_status === 'string') {
+        return envelope.data;
+    }
     if (!envelope || envelope.success !== true || !envelope.data) {
         throw new Error('AutoGoPay menolak request. Cek koneksi merchant/langganan di dashboard.');
     }
@@ -82,7 +89,7 @@ async function createTransaction(orderId, amount, onCreated) {
 }
 async function fetchPaymentStatus(txnId) {
     if (!txnId) throw new Error('ID transaksi AutoGoPay tidak tersedia.');
-    const data = await request('/qris/status', { transaction_id: txnId }, 6000);
+    const data = await request('/qris/status', { transaction_id: txnId }, 6000, { statusEnvelope: true });
     // Some status responses omit the ID; an explicitly different ID is never accepted.
     if (data.transaction_id && String(data.transaction_id) !== String(txnId)) {
         throw new Error('ID transaksi AutoGoPay tidak cocok.');

@@ -4618,6 +4618,27 @@ bot.command('agpstatus', async ctx => {
     const pending = await Order.countDocuments({ paymentGateway: 'autogopay', status: 'PENDING' });
     await ctx.reply(`AutoGoPay\nSiap: ${agpReady}\nCircuit dihentikan: ${!!settings.autogopayCircuitOpen}\nInvoice aktif: ${settings.autogopayActiveOrder || '-'}\nPending: ${pending}\nJeda berikutnya: ${settings.autogopayNextGenerateAt || '-'}\nBatas bot: 1 invoice aktif, 60 detik, 20/jam, 100/hari.`);
 });
+// Cek langsung ke AutoGoPay untuk setiap order AutoGoPay yang masih PENDING, lalu
+// selesaikan yang statusnya sudah pasti (lunas → kirim akun; expire/cancel → stok kembali).
+bot.command('agpcek', async ctx => {
+    if (!ownerIdList().includes(String(ctx.from.id))) return;
+    const orders = await Order.find({ paymentGateway: 'autogopay', status: 'PENDING' }).sort({ createdAt: 1 }).limit(10).lean();
+    if (!orders.length) return ctx.reply('Tidak ada order AutoGoPay yang PENDING. Kalau circuit masih dihentikan, kirim /agplanjut.');
+    const lines = [];
+    for (const o of orders) {
+        let status = 'tanpa ID transaksi (cocokkan manual di dashboard)';
+        if (o.autogopayTxnId) {
+            status = await autogopayStatusOf(o.autogopayTxnId, o.totalPaid || o.amount) || 'tidak terbaca (API gagal / nominal beda)';
+            if (status === 'completed') await settleAutoGoPay(o).catch(e => { status += ` → gagal diproses: ${e.message}`; });
+            else if (['expired', 'cancelled'].includes(status)) {
+                const done = await expireAutoGoPayOrder(o.orderId, status).catch(e => { status += ` → gagal: ${e.message}`; return false; });
+                if (done) status += ' → stok dikembalikan';
+            }
+        }
+        lines.push(`${o.orderId}: ${status}`);
+    }
+    await ctx.reply(`Status AutoGoPay:\n${lines.join('\n')}\n\nSetelah tidak ada yang PENDING, kirim /agplanjut.`);
+});
 bot.command('agplanjut', async ctx => {
     if (!ownerIdList().includes(String(ctx.from.id))) return;
     const session = await mongoose.startSession();

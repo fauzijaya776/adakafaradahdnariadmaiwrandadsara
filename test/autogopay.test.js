@@ -122,6 +122,18 @@ test('expiry tidak wajar tidak membatalkan invoice: identitas tersimpan dan QRIS
     assert.equal(identity.txnId,'tx-1');assert.equal(identity.realOrderId,'agp-1');
     const ms=tx.expiresAt.getTime()-before;assert.ok(ms>=15*60000-1000&&ms<=15*60000+5000,String(ms));
 });
+test('status belum lunas dikirim dengan success:false; tetap terbaca (pending/expire/cancel)', async () => {
+    for (const [raw, want] of [['pending', 'pending'], ['expire', 'expired'], ['cancel', 'cancelled'], ['', 'unknown']]) {
+        const { api } = load({ success: false, message: 'Transaction status: ' + raw,
+            data: { transaction_id: raw ? 'tx-1' : '', transaction_status: raw, transaction_time: raw ? '2026-10-30 18:43:10' : '' } });
+        assert.equal((await api.checkPaymentStatus('tx-1')).status, want, raw);
+    }
+    // settlement tetap success:true
+    const { api } = load({ success: true, message: 'Transaction successful', data: { transaction_id: 'tx-1', transaction_status: 'settlement' } });
+    assert.equal((await api.checkPaymentStatus('tx-1')).status, 'completed');
+    // generate dengan success:false tetap ditolak
+    await assert.rejects(load({ success: false, message: 'x', data: { transaction_status: '' } }).api.createTransaction('local', 10000));
+});
 test('parallel status reads share one network request',async()=>{
     const {api,calls}=load({success:true,data:{transaction_status:'pending'}});
     await Promise.all([api.checkPaymentStatus('same'),api.checkPaymentStatus('same'),api.checkPaymentStatus('same')]);

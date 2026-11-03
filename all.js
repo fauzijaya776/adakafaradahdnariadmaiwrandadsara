@@ -88,6 +88,7 @@ const databaseReady = connectDB().then(async () => {
 // Inisialisasi Express App dan Telegraf Bot
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const botRunner = require('./bot_runner')(bot);
 const agpDelivery = require('./autogopay_delivery')({
     Order, telegram: bot.telegram,
     formatItemsForFile: async (items, order) => {
@@ -3305,7 +3306,11 @@ app.post('/autogopay/callback', async (req, res) => {
 // Tanda tangan: header X-Callback-Signature = HMAC-SHA256(raw body, QRIN_TOKEN).
 // Health check publik (tanpa login) untuk Render + keep-alive pinger
 // (mis. UptimeRobot ping tiap ~10 menit agar Render Free tidak tidur).
-app.get(['/health', '/ping'], (req, res) => res.status(200).send('OK'));
+app.get(['/health', '/ping'], (req, res) => {
+    const healthy = mongoose.connection.readyState === 1 && botRunner.isHealthy();
+    res.set('Cache-Control', 'no-store');
+    res.status(healthy ? 200 : 503).send(healthy ? 'OK' : 'NOT READY');
+});
 
 // Menangani DUA gateway pada satu route:
 //  - PAKASIR v2 : POST dengan header X-Secret, body { txn_id, order_id, status:"completed", amount, ... }
@@ -4542,14 +4547,12 @@ bot.telegram.setMyCommands([
 });
 
 // Jalankan Admin Panel Express
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
     console.log(`✅ Admin panel berjalan di http://localhost:${PORT}`);
 });
 
 // Jalankan Telegram Bot
-databaseReady.then(() => bot.launch()).then(() => {
-    console.log('✅ Bot Telegram berhasil terhubung dan berjalan...');
-}).catch(err => {
+databaseReady.then(() => botRunner.start()).catch(err => {
     console.error('❌ Error saat menjalankan bot:', err);
 });
 
@@ -4589,8 +4592,7 @@ if (alimSync.isEnabled()) {
 setTimeout(() => docheck.runDigitalOceanCheck(bot), 60 * 1000);
 setInterval(() => docheck.runDigitalOceanCheck(bot), docheck.CHECK_INTERVAL_MS);
 
-// Jaring pengaman: jangan biarkan error tak tertangkap mematikan seluruh bot
-// (mis. error di dalam polling/timer). Cukup dicatat + dilaporkan ke owner.
+// Rejection timer dilaporkan; exception fatal memicu restart proses oleh Render.
 process.on('unhandledRejection', (reason) => {
     console.error('[UNHANDLED REJECTION]', reason);
     const owners = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
@@ -4601,14 +4603,26 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
     console.error('[UNCAUGHT EXCEPTION]', err);
+    // A fatal exception can leave state inconsistent; let Render restart the process.
+    botRunner.stop('uncaughtException');
+    setTimeout(() => process.exit(1), 1000).unref();
     const owners = (process.env.OWNER_ID || '').split(',').map(id => id.trim()).filter(Boolean);
     for (const o of owners) {
         bot.telegram.sendMessage(o, `⚠️ [BOT] Uncaught exception:\n${err.message}`).catch(() => {});
     }
 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+let shuttingDown = false;
+function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    botRunner.stop(signal);
+    httpServer.close();
+    // Leave time for in-flight handlers before Render's forced termination.
+    setTimeout(() => process.exit(0), 25000).unref();
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 
 // Merchant controls: no command resets counters or cancels an uncertain invoice.
@@ -4659,3 +4673,4 @@ bot.command('agplanjut', async ctx => {
 // Restart recovery for AutoGoPay invoices, including failures while sending the QR image.
 setTimeout(sweepAutoGoPayOrders, 25 * 1000);
 setInterval(sweepAutoGoPayOrders, 60 * 1000);
+

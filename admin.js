@@ -199,7 +199,7 @@ async function buildAlimTrackText(rawInput) {
     } else {
       const st = alimCair.statusOf(d);
       text += 'Status: ⏳ *Belum dibayarkan* ke Alim\n' +
-        (st.ready ? `Pencairan Pakasir: ✅ *sudah bisa dicairkan* (sejak ${st.label} WIB)\n` : `Pencairan Pakasir: ⏳ *tertunda*, bisa cair ${st.label} WIB\n`);
+        (st.ready ? `Pencatatan pencairan: ✅ *sudah bisa dicairkan* (sejak ${st.label} WIB)\n` : `Pencatatan pencairan: ⏳ *tertunda*, bisa cair ${st.label} WIB\n`);
     }
   });
   return { found: true, text };
@@ -225,7 +225,7 @@ async function handleAlimTrackInput(ctx) {
 }
 
 async function buildDanaAlimView(notice) {
-  // Dipisah: sudah bisa dicairkan (H+1 12.00 WIB, Minggu -> Senin) vs masih tertunda.
+  // Dipisah: sudah bisa dicairkan (satu jam setelah pembayaran, setiap hari) vs masih tertunda.
   const sum = await alimCair.summarize(AlimSale, alimSourceTotals);
   const { total, count, cair, tertunda } = sum;
 
@@ -244,9 +244,10 @@ async function buildDanaAlimView(notice) {
     `├ ${ALIM_SOURCE_LABEL.tele}: ${rpFmt(cair.tele.total)} (${cair.tele.count} order)\n` +
     `└ ${ALIM_SOURCE_LABEL.web}: ${rpFmt(cair.web.total)} (${cair.web.count} order)\n` +
     `⏳ *Masih tertunda: ${rpFmt(tertunda.total)}* (${tertunda.count} order)\n`;
-  tertunda.schedule.forEach((g, i) => {
+  tertunda.schedule.slice(0, 4).forEach((g, i) => {
     text += `${i === tertunda.schedule.length - 1 ? '└' : '├'} cair ${g.label}: ${rpFmt(g.total)} (${g.count} order)\n`;
   });
+  if (tertunda.schedule.length > 4) text += `… dan ${tertunda.schedule.length - 4} jadwal lainnya.\n`;
   if (recent.length > 0) {
     text += `\n*${count > recent.length ? `10 order terbaru dari ${count}` : 'Daftar order'}:*\n`;
     recent.forEach((r) => {
@@ -271,7 +272,7 @@ async function buildDanaAlimView(notice) {
   if (sync.webhookRejectedAt && (!sync.webhookOkAt || sync.webhookRejectedAt > sync.webhookOkAt)) {
     text += `\n❗ Webhook DITOLAK (X-Secret salah) terakhir: ${wibFmt(sync.webhookRejectedAt)}`;
   }
-  text += '\n\n_Pakasir mencairkan H+1 jam 12.00 WIB; hari Minggu libur (dibayar Sabtu/Minggu → cair Senin 12.00). Hanya catatan, tidak memengaruhi saldo Pakasir._';
+  text += '\n\n_Dana Alim siap dicatat untuk pencairan 1 jam setelah pembayaran, setiap hari. Hanya catatan; saldo aktual mengikuti gateway dan tidak ada transfer otomatis._';
 
   const rows = [];
   // Yang di-reset HANYA yang sudah bisa dicairkan dan tampil di layar ini:

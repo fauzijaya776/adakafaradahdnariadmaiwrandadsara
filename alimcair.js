@@ -1,19 +1,12 @@
-// alimcair.js
-// Jadwal pencairan Dana Alim — memisahkan dana yang SUDAH BISA DICAIRKAN dari yang MASIH TERTUNDA.
-//
-// Aturan Pakasir: setiap transaksi masuk "saldo tertunda" dulu, lalu pindah ke saldo utama
-// H+1 jam 12.00 WIB (dihitung per TANGGAL, bukan 24 jam). Hari Minggu libur, jadi pencairan
-// yang jatuh di hari Minggu digeser ke Senin 12.00 WIB:
-//   dibayar Senin s/d Jumat -> cair besoknya 12.00
-//   dibayar Sabtu atau Minggu -> cair Senin 12.00
-// Hanya perhitungan tampilan / reset — tidak mengubah apa pun di Pakasir.
+// Dana Alim siap dicatat untuk pencairan satu jam setelah pembayaran.
+// Kebijakan pencatatan berlaku setiap hari; bukan instruksi transfer ke gateway.
 'use strict';
 
 const crypto = require('crypto');
 const moment = require('moment-timezone');
 
 const TZ = 'Asia/Jakarta';
-const CAIR_HOUR = 12;
+const CAIR_DELAY_MS = 60 * 60 * 1000;
 const HARI = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
 
 // Waktu bayar sebuah catatan Dana Alim (catatan lama mungkin belum punya completedAt).
@@ -23,31 +16,21 @@ function paidAtOf(doc) {
 
 // Kapan order yang dibayar pada `paidAt` bisa dicairkan.
 function cairAt(paidAt) {
-    const d = moment(paidAt).tz(TZ).startOf('day').add(1, 'day');
-    if (d.day() === 0) d.add(1, 'day'); // Minggu libur -> Senin
-    return d.hour(CAIR_HOUR).toDate();
+    return new Date(new Date(paidAt).getTime() + CAIR_DELAY_MS);
 }
 
-// Batas waktu bayar: order yang dibayar SEBELUM batas ini sudah bisa dicairkan pada `now`.
-// cairAt() tidak pernah mundur kalau tanggal bayar maju, jadi cukup cari hari bayar terakhir
-// yang sudah cair. Hari ini tidak mungkin (cair paling cepat besok); paling jauh 3 hari ke
-// belakang (Senin pagi -> order Jumat), dan 3 hari ke belakang selalu sudah cair.
+// Batas inklusif: pembayaran tepat satu jam lalu sudah siap.
 function cairCutoff(now = new Date()) {
-    const today = moment(now).tz(TZ).startOf('day');
-    for (let back = 1; back < 3; back++) {
-        const day = today.clone().subtract(back, 'days');
-        if (cairAt(day.toDate()) <= now) return day.add(1, 'day').toDate();
-    }
-    return today.clone().subtract(2, 'days').toDate(); // = hari bayar 3 hari lalu sudah cair
+    return new Date(new Date(now).getTime() - CAIR_DELAY_MS);
 }
 
 // Kondisi MongoDB: catatan yang dibayar sebelum / sesudah `cutoff`. Dipakai di dalam $and
 // supaya tidak menimpa $or lain di filter yang sama.
 function paidBefore(cutoff) {
-    return { $or: [{ completedAt: { $lt: cutoff } }, { completedAt: null, createdAt: { $lt: cutoff } }] };
+    return { $or: [{ completedAt: { $lte: cutoff } }, { completedAt: null, createdAt: { $lte: cutoff } }] };
 }
 function paidFrom(cutoff) {
-    return { $or: [{ completedAt: { $gte: cutoff } }, { completedAt: null, createdAt: { $gte: cutoff } }] };
+    return { $or: [{ completedAt: { $gt: cutoff } }, { completedAt: null, createdAt: { $gt: cutoff } }] };
 }
 const cairMatch = (cutoff) => ({ settled: false, $and: [paidBefore(cutoff)] });
 const tertundaMatch = (cutoff) => ({ settled: false, $and: [paidFrom(cutoff)] });
@@ -94,12 +77,12 @@ async function summarize(AlimSale, sourceTotals, now = new Date()) {
         { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 }, latest: { $max: '$createdAt' } } },
     ]);
     const bySrc = await sourceTotals(cairMatch(cutoff));
-    // Yang tertunda paling banyak order 3 hari terakhir -> dikelompokkan per jadwal cair di sini.
+    // Yang tertunda belum berumur satu jam -> dikelompokkan per menit jadwal cair.
     const pending = await AlimSale.find(tertundaMatch(cutoff), { amount: 1, completedAt: 1, createdAt: 1 }).lean();
     const groups = new Map();
     let pTotal = 0;
     for (const p of pending) {
-        const at = cairAt(paidAtOf(p));
+        const at = new Date(Math.ceil(cairAt(paidAtOf(p)).getTime() / 60000) * 60000);
         const key = at.getTime();
         const g = groups.get(key) || { at, label: cairLabel(at), total: 0, count: 0 };
         g.total += Number(p.amount) || 0;
@@ -135,4 +118,5 @@ function statusOf(doc, now = new Date()) {
     return { at, label: cairLabel(at), ready: at <= now };
 }
 
-module.exports = { TZ, cairAt, cairCutoff, paidBefore, paidFrom, cairMatch, tertundaMatch, clampCutoff, resetFilter, cairLabel, summarize, settle, statusOf, paidAtOf };
+module.exports = { TZ, CAIR_DELAY_MS, cairAt, cairCutoff, paidBefore, paidFrom, cairMatch, tertundaMatch, clampCutoff, resetFilter, cairLabel, summarize, settle, statusOf, paidAtOf };
+

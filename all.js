@@ -71,19 +71,32 @@ const pembeliDo = createPembeliDo({
 });
 // === 2. INISIALISASI & KONEKSI DATABASE ===
 let agpReady = false;
-const databaseReady = connectDB().then(async () => {
-    // Await unique indexes and protect invoices created by earlier migration revisions.
-    await Order.init(); await Settings.init();
-    await Order.updateMany({ paymentGateway: 'autogopay' }, { $unset: { expiresAt: '' } });
-    const unresolved = await Order.find({ paymentGateway: 'autogopay', status: 'PENDING' }).limit(2).lean();
-    if (unresolved.length) {
-        await Settings.updateOne({ identifier: 'global-settings' }, { $set: {
-            autogopayActiveOrder: unresolved[0].orderId,
-            ...(unresolved.length > 1 ? { autogopayCircuitOpen: true } : {}),
-        } }, { upsert: true });
+async function initializeDatabase() {
+    let retryDelay = 5000;
+    while (true) {
+        try {
+            await connectDB();
+            // Verify unique indexes and protect invoices created by earlier migration revisions.
+            // createIndexes can retry after an outage; Model.init caches its rejected promise.
+            await Order.createIndexes(); await Settings.createIndexes();
+            await Order.updateMany({ paymentGateway: 'autogopay' }, { $unset: { expiresAt: '' } });
+            const unresolved = await Order.find({ paymentGateway: 'autogopay', status: 'PENDING' }).limit(2).lean();
+            if (unresolved.length) {
+                await Settings.updateOne({ identifier: 'global-settings' }, { $set: {
+                    autogopayActiveOrder: unresolved[0].orderId,
+                    ...(unresolved.length > 1 ? { autogopayCircuitOpen: true } : {}),
+                } }, { upsert: true });
+            }
+            agpReady = true;
+            return;
+        } catch (error) {
+            console.error(`[DB] Startup belum siap; mencoba kembali dalam ${retryDelay / 1000} detik:`, error.message);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            retryDelay = Math.min(retryDelay * 2, 30000);
+        }
     }
-    agpReady = true;
-}).catch(error => { console.error('[AUTOGOPAY] Startup safety checks failed:', error.message); });
+}
+const databaseReady = initializeDatabase();
 
 // Inisialisasi Express App dan Telegraf Bot
 const app = express();
@@ -3307,9 +3320,15 @@ app.post('/autogopay/callback', async (req, res) => {
 // Health check publik (tanpa login) untuk Render + keep-alive pinger
 // (mis. UptimeRobot ping tiap ~10 menit agar Render Free tidak tidur).
 app.get(['/health', '/ping'], (req, res) => {
-    const healthy = mongoose.connection.readyState === 1 && botRunner.isHealthy();
+    const healthy = botRunner.isAlive();
     res.set('Cache-Control', 'no-store');
     res.status(healthy ? 200 : 503).send(healthy ? 'OK' : 'NOT READY');
+});
+// Readiness is for monitoring; Render uses /health so retries/rolling deploys can finish.
+app.get('/ready', (req, res) => {
+    const ready = agpReady && mongoose.connection.readyState === 1 && botRunner.isHealthy();
+    res.set('Cache-Control', 'no-store');
+    res.status(ready ? 200 : 503).send(ready ? 'READY' : 'NOT READY');
 });
 
 // Menangani DUA gateway pada satu route:

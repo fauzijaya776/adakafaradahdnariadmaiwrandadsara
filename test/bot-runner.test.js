@@ -21,6 +21,7 @@ function harness(api = async () => []) {
             await this.telegram.callApi('getMe');
             onLaunch();
             await this.telegram.callApi('deleteWebhook');
+            await this.telegram.callApi('getUpdates', { timeout: 50 });
             return new Promise((resolve, reject) => { poll = { resolve, reject }; });
         },
         stop() {
@@ -29,7 +30,7 @@ function harness(api = async () => []) {
         },
     };
     const context = {
-        module: { exports: {} }, Date: { now: () => now },
+        module: { exports: {} }, Date: { now: () => now }, AbortController,
         setTimeout: (callback, delay) => { const id = {}; timers.set(id, { callback, delay }); return id; },
         clearTimeout: id => timers.delete(id),
         console: Object.fromEntries(['log', 'warn', 'error'].map(name => [name, (...args) => logs.push(args.join(' '))])),
@@ -120,11 +121,12 @@ for (const pendingMethod of ['getMe', 'deleteWebhook']) {
     });
 }
 
-test('public health routes return 503 for stopped polling or disconnected DB and disable caching', () => {
+test('Render health stays live during dependency recovery; readiness reports the outage', () => {
     let handler;
     const context = {
         app: { get: (paths, fn) => { assert.equal(JSON.stringify(paths), '["/health","/ping"]'); handler = fn; } },
-        mongoose: { connection: { readyState: 1 } }, botRunner: { isHealthy: () => true },
+        agpReady: true, mongoose: { connection: { readyState: 1 } },
+        botRunner: { isAlive: () => true, isHealthy: () => true },
     };
     const start = appSource.indexOf("app.get(['/health', '/ping']");
     vm.runInNewContext(appSource.slice(start, appSource.indexOf('\n});', start) + 4), context);
@@ -137,8 +139,21 @@ test('public health routes return 503 for stopped polling or disconnected DB and
     }
     assert.deepEqual(request(), { 'Cache-Control': 'no-store', status: 200, text: 'OK' });
     context.botRunner.isHealthy = () => false;
-    assert.equal(request().status, 503);
+    assert.equal(request().status, 200);
     context.botRunner.isHealthy = () => true; context.mongoose.connection.readyState = 0;
+    assert.equal(request().status, 200);
+    context.botRunner.isAlive = () => false;
+    assert.equal(request().status, 503);
+    context.botRunner.isAlive = () => true;
+    context.app.get = (path, fn) => { assert.equal(path, '/ready'); handler = fn; };
+    const readyStart = appSource.indexOf("app.get('/ready'");
+    vm.runInNewContext(appSource.slice(readyStart, appSource.indexOf('\n});', readyStart) + 4), context);
+    assert.equal(request().status, 503);
+    context.mongoose.connection.readyState = 1;
+    assert.deepEqual(request(), { 'Cache-Control': 'no-store', status: 200, text: 'READY' });
+    context.botRunner.isHealthy = () => false;
+    assert.equal(request().status, 503);
+    context.botRunner.isHealthy = () => true; context.agpReady = false;
     assert.equal(request().status, 503);
 });
 
@@ -163,11 +178,15 @@ test('installed Telegraf recovers from 409 with a fresh poller and stops on SIGT
     let deletedWebhooks = 0;
     bot.telegram.callApi = async (method, payload, controller) => {
         if (method === 'getMe') return { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' };
-        if (method === 'deleteWebhook') { deletedWebhooks++; return true; }
+        if (method === 'deleteWebhook') {
+            assert.notEqual(payload.drop_pending_updates, true);
+            deletedWebhooks++; return true;
+        }
         assert.equal(method, 'getUpdates');
         assert.notEqual(payload.drop_pending_updates, true);
         polls++;
         if (polls === 1) throw new TelegramError({ error_code: 409, description: 'Conflict' });
+        if (polls === 2) return [];
         return new Promise((resolve, reject) => {
             controller.signal.addEventListener('abort', () => {
                 const error = new Error('aborted'); error.name = 'AbortError'; reject(error);
@@ -180,9 +199,67 @@ test('installed Telegraf recovers from 409 with a fresh poller and stops on SIGT
     const task = runner.start(); await flush();
     assert.equal(polls, 1); assert.equal(runner.isHealthy(), false);
     t.mock.timers.tick(5000); await flush();
-    assert.equal(polls, 2); assert.equal(deletedWebhooks, 2);
+    assert.equal(polls, 3); assert.equal(deletedWebhooks, 2);
     assert.equal(runner.isHealthy(), true);
     runner.stop('SIGTERM'); await task;
     t.mock.timers.tick(60000); await flush();
-    assert.equal(polls, 2); assert.equal(runner.isHealthy(), false);
+    assert.equal(polls, 3); assert.equal(runner.isHealthy(), false);
+});
+
+for (const method of ['getMe', 'deleteWebhook', 'getUpdates']) {
+    test(`hung ${method} is aborted and retried while Render liveness stays healthy`, async () => {
+        let stalled = true;
+        let aborted = 0;
+        const h = harness((name, payload, options) => {
+            if (name !== method || !stalled) return [];
+            return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => {
+                aborted++;
+                const error = new Error('aborted'); error.name = 'AbortError'; reject(error);
+            }, { once: true }));
+        });
+        const task = h.runner.start(); await flush();
+        assert.equal(h.runner.isAlive(), true);
+        assert.equal(h.runner.isHealthy(), false);
+        assert.equal(h.delay, method === 'getUpdates' ? 75000 : 20000);
+        await h.retry();
+        assert.equal(aborted, 1); assert.equal(h.delay, 5000);
+        assert.equal(h.runner.isAlive(), true); assert.equal(h.runner.isHealthy(), false);
+        assert.ok(h.logs.some(line => line.includes(`${method} timeout`)));
+        stalled = false; await h.retry();
+        assert.equal(h.runner.isHealthy(), true);
+        h.runner.stop('SIGTERM'); await task;
+        assert.equal(h.runner.isAlive(), false); assert.equal(h.timers.size, 0);
+    });
+}
+
+test('real Telegraf aborts a hung long poll, syncs offset, and launches a fresh poller', async t => {
+    const { Telegraf } = require('telegraf');
+    const bot = new Telegraf('test-token');
+    let polls = 0; let syncs = 0; let concurrent = 0; let maxConcurrent = 0;
+    bot.telegram.callApi = async (method, payload, { signal } = {}) => {
+        if (method === 'getMe') return { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' };
+        if (method === 'deleteWebhook') { assert.notEqual(payload.drop_pending_updates, true); return true; }
+        assert.equal(method, 'getUpdates');
+        if (payload.limit === 1) { syncs++; return []; }
+        polls++;
+        if (polls === 2) return [];
+        concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent);
+        return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+            concurrent--; const error = new Error('aborted'); error.name = 'AbortError'; reject(error);
+        }, { once: true }));
+    };
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'warn', () => {});
+    t.mock.method(console, 'error', () => {});
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const runner = require('../bot_runner')(bot);
+    t.after(() => runner.stop('cleanup'));
+    const task = runner.start(); await flush();
+    assert.equal(polls, 1); assert.equal(runner.isHealthy(), false);
+    t.mock.timers.tick(75000); await flush();
+    assert.equal(syncs, 1); assert.equal(concurrent, 0); assert.equal(runner.isAlive(), true);
+    t.mock.timers.tick(5000); await flush();
+    assert.equal(polls, 3); assert.equal(runner.isHealthy(), true); assert.equal(maxConcurrent, 1);
+    runner.stop('SIGTERM'); await task;
+    assert.equal(concurrent, 0); assert.equal(polls, 3);
 });

@@ -2,13 +2,12 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 
 const connectDB = async () => {
-    try {
-        await mongoose.connect(process.env.MONGO_URI);
-        console.log('MongoDB Connected...');
-    } catch (err) {
-        console.error(err.message);
-        process.exit(1);
-    }
+    // Let the bot retry temporary outages; CLI callers still receive a rejected promise.
+    await mongoose.connect(process.env.MONGO_URI, {
+        serverSelectionTimeoutMS: 15000,
+        connectTimeoutMS: 10000,
+    });
+    console.log('MongoDB Connected...');
 };
 
 // Skema untuk Variant dalam Produk

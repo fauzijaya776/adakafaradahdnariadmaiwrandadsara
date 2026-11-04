@@ -9,11 +9,34 @@ module.exports = function createBotRunner(bot) {
     let retryTimer;
     let wakeRetry;
     let task;
+    const requests = new Set();
     const callApi = bot.telegram.callApi.bind(bot.telegram);
 
-    bot.telegram.callApi = async (method, ...args) => {
-        if (stopping && method === 'getUpdates') throw new Error('Bot is stopping');
-        const result = await callApi(method, ...args);
+    bot.telegram.callApi = async (method, payload, options) => {
+        const lifecycle = ['getMe', 'deleteWebhook', 'getUpdates'].includes(method);
+        if (stopping && lifecycle) throw new Error('Bot is stopping');
+        if (!lifecycle) return callApi(method, payload, options);
+        // Telegraf's default HTTP timeout is 500s; a stuck request must release the poller.
+        const timeout = method === 'getUpdates' && payload?.timeout ? 75000 : 20000;
+        const controller = new AbortController();
+        const upstream = options?.signal;
+        const abort = () => controller.abort();
+        if (upstream?.aborted) abort();
+        else upstream?.addEventListener('abort', abort, { once: true });
+        requests.add(controller);
+        let timedOut = false;
+        const timer = setTimeout(() => { timedOut = true; abort(); }, timeout);
+        let result;
+        try {
+            result = await callApi(method, payload, { ...options, signal: controller.signal });
+        } catch (err) {
+            if (timedOut) throw new Error(`${method} timeout setelah ${timeout / 1000} detik`);
+            throw err;
+        } finally {
+            clearTimeout(timer);
+            upstream?.removeEventListener('abort', abort);
+            requests.delete(controller);
+        }
         // Shutdown can arrive while launch is waiting for deleteWebhook.
         if (stopping && method === 'deleteWebhook') throw new Error('Bot is stopping');
         if (!stopping && running && method === 'getUpdates') {
@@ -29,7 +52,7 @@ module.exports = function createBotRunner(bot) {
                 await bot.launch({}, () => {
                     if (stopping) throw new Error('Bot is stopping');
                     running = true;
-                    lastPollAt = Date.now();
+                    lastPollAt = 0;
                     console.log('[BOT] Telegram terhubung; memulai polling.');
                 });
                 if (!stopping) console.error('[BOT] Polling berhenti tanpa permintaan shutdown.');
@@ -60,14 +83,19 @@ module.exports = function createBotRunner(bot) {
             if (!task) task = run();
             return task;
         },
+        isAlive() {
+            // Dependency outages are retried here; restarting Render can prolong a 409 deploy conflict.
+            return !stopping;
+        },
         isHealthy() {
             // getUpdates normally completes within 50s, including when the bot is idle.
-            return !stopping && running && Date.now() - lastPollAt < 120000;
+            return !stopping && running && lastPollAt > 0 && Date.now() - lastPollAt < 120000;
         },
         stop(reason) {
             if (stopping) return;
             stopping = true;
             running = false;
+            for (const controller of requests) controller.abort();
             clearTimeout(retryTimer);
             if (wakeRetry) wakeRetry();
             try { bot.stop(reason); }

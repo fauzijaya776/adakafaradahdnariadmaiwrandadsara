@@ -9,6 +9,7 @@ module.exports = function createBotRunner(bot) {
     let retryTimer;
     let wakeRetry;
     let task;
+    let lastFailure = null;
     const requests = new Set();
     const callApi = bot.telegram.callApi.bind(bot.telegram);
 
@@ -58,6 +59,7 @@ module.exports = function createBotRunner(bot) {
                 if (!stopping) console.error('[BOT] Polling berhenti tanpa permintaan shutdown.');
             } catch (err) {
                 if (!stopping) {
+                    lastFailure = { code: String(err.code || err.response?.error_code || err.name || 'Error'), at: Date.now() };
                     console.error('[BOT] Polling/launch gagal:', err);
                     if (Number(err.code || err.response?.error_code) === 409) {
                         console.error('[BOT] 409 Conflict: pastikan hanya satu proses/server memakai BOT_TOKEN ini.');
@@ -86,6 +88,9 @@ module.exports = function createBotRunner(bot) {
         isAlive() {
             // Dependency outages are retried here; restarting Render can prolong a 409 deploy conflict.
             return !stopping;
+        },
+        lastFailure() {
+            return lastFailure && { ...lastFailure };
         },
         isHealthy() {
             // getUpdates normally completes within 50s, including when the bot is idle.

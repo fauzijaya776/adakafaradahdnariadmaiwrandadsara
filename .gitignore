@@ -11,3 +11,8 @@ env-1
 Claude outputs/
 *.rar
 .upload-tmp/
+
+# Abaikan juga varian file environment; contoh tanpa nilai rahasia boleh disimpan.
+.env.*
+!.env.example
+!.env.*.example

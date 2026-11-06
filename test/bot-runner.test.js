@@ -162,6 +162,7 @@ test('fatal exceptions stop polling and exit with failure instead of leaving a l
     const context = {
         process: { on: (_, fn) => { handler = fn; }, env: {}, exit: code => { exitCode = code; } },
         botRunner: { stop: reason => { stopped = reason; } }, console: { error() {} },
+        updateGuard: { stop() {} },
         setTimeout: (fn, delay) => { assert.equal(delay, 1000); exitTimer = fn; return { unref() {} }; },
     };
     const start = appSource.indexOf("process.on('uncaughtException'");

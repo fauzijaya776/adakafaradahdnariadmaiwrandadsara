@@ -101,6 +101,8 @@ const databaseReady = initializeDatabase();
 // Inisialisasi Express App dan Telegraf Bot
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const protectTelegram = require('./telegram_timeout');
+protectTelegram(bot.telegram);
 const botRunner = require('./bot_runner')(bot);
 const agpDelivery = require('./autogopay_delivery')({
     Order, telegram: bot.telegram,
@@ -124,24 +126,34 @@ const agpDelivery = require('./autogopay_delivery')({
 });
 async function deliverAutoGoPay(order) { return agpDelivery.deliver(order); }
 
-// Setiap update Telegram diproses di LATAR BELAKANG. Tanpa ini Telegraf menunggu
-// handler selesai sebelum mengambil update berikutnya, jadi proses panjang
-// (cek Gmail, /statusdo, /cekdo, membuat QRIS) membuat bot diam untuk SEMUA pembeli.
-// Error tetap diteruskan ke bot.catch seperti biasa.
+// Keep slow buyers independent without allowing unlimited background work.
+const updateGuard = require('./update_guard')({
+    isOwner: ctx => ownerIdList().includes(String(ctx.from?.id)),
+    onError: (error, ctx) => bot.handleError(error, ctx),
+});
 bot.use((ctx, next) => {
-    Promise.resolve()
-        .then(next)
-        .catch((err) => {
-            try {
-                if (typeof bot.handleError === 'function') return bot.handleError(err, ctx);
-            } catch (e) { /* jatuh ke log di bawah */ }
-            console.error('[BOT] Error tak tertangani:', err);
-        })
-        .catch((e) => console.error('[BOT] Error di penanganan error:', e));
+    protectTelegram(ctx.telegram);
+    updateGuard.dispatch(ctx, next);
 });
 // Tombol "Matikan notifikasi" di bawah setiap testimoni channel. Didaftarkan PALING AWAL
 // supaya subscriber channel yang menekannya tidak ikut tercatat sebagai user bot.
 testimoni.attach(bot);
+
+// This diagnostic must work even when database initialization cannot finish.
+bot.command('botstatus', async ctx => {
+    if (!ownerIdList().includes(String(ctx.from.id))) return;
+    const stats = updateGuard.stats();
+    const failure = botRunner.lastFailure();
+    await ctx.reply(`Status bot\nCommit: ${String(process.env.RENDER_GIT_COMMIT || 'lokal').slice(0, 7)}\nPolling: ${botRunner.isHealthy() ? 'aktif' : 'memulihkan koneksi'}\nError polling terakhir: ${failure ? `${failure.code} (${new Date(failure.at).toISOString()})` : '-'}\nDatabase: ${mongoose.connection.readyState === 1 ? 'terhubung' : 'belum terhubung'}\nPembayaran siap: ${agpReady}\nRAM RSS: ${Math.round(process.memoryUsage().rss / 1048576)} MB\nPekerjaan aktif: ${stats.active}\nAntrean: ${stats.queued}\nUpdate dibatasi sejak restart: ${stats.dropped}\nUptime: ${Math.floor(process.uptime())} detik`);
+});
+bot.use(async (ctx, next) => {
+    if (agpReady && mongoose.connection.readyState === 1) return next();
+    if (ctx.callbackQuery) {
+        await ctx.answerCbQuery('Database sedang dipulihkan. Coba lagi sebentar.', { show_alert: true }).catch(() => {});
+    } else if (ctx.message && ctx.chat?.type === 'private') {
+        await ctx.reply('Sistem sedang memulihkan koneksi database. Coba lagi sebentar. Jika sudah membayar, simpan bukti dan jangan membuat pembayaran ulang.').catch(() => {});
+    }
+});
 
 // /testiulang <ID order> — kirim ulang testimoni order tertentu ke channel (khusus owner).
 // Berguna untuk order yang testimoninya terlanjur tidak masuk sebelum antrean ada.
@@ -585,7 +597,7 @@ const storage = multer.diskStorage({
         cb(null, Date.now() + path.extname(file.originalname));
     }
 });
-const upload = multer({ storage });
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
@@ -662,6 +674,7 @@ app.post('/login', (req, res) => {
         if (loginFails.size > 5000) {
             // buang catatan yang sudah lewat 15 menit saja (bukan semuanya)
             for (const [k, v] of loginFails) if (now - v.first >= 15 * 60 * 1000) loginFails.delete(k);
+            while (loginFails.size > 5000) loginFails.delete(loginFails.keys().next().value);
         }
         res.redirect('/login?error=Invalid username or password');
     }
@@ -1310,11 +1323,22 @@ function getPromoInlineKeyboard() {
     ]);
 }
 
+// Menu queries return counts, never the potentially large arrays of account credentials.
+const PRODUCT_MENU_FIELDS = {
+    id: 1, name: 1, description: 1,
+    variants: { $map: { input: { $ifNull: ['$variants', []] }, as: 'v', in: {
+        name: '$$v.name', slug: '$$v.slug', price: '$$v.price', bulk_pricing: '$$v.bulk_pricing',
+        stockCount: { $size: { $ifNull: ['$$v.stock', []] } },
+    } } },
+};
 async function generateProductListMessageAndKeyboard(page = 1) {
     const productsPerPage = 10;
     const totalProducts = await Product.countDocuments();
     const totalPages = Math.ceil(totalProducts / productsPerPage);
-    const products = await Product.find({}).sort({ name: 1 }).skip((page - 1) * productsPerPage).limit(productsPerPage).lean();
+    const products = await Product.aggregate([
+        { $sort: { name: 1 } }, { $skip: (page - 1) * productsPerPage }, { $limit: productsPerPage },
+        { $project: PRODUCT_MENU_FIELDS },
+    ]);
 
     let message = `*LIST PRODUK*\nPage ${page}/${totalPages}\n────────────✧\n`;
     const keyboardButtons = [];
@@ -1325,7 +1349,7 @@ async function generateProductListMessageAndKeyboard(page = 1) {
         products.forEach((p, index) => {
             const productNumber = (page - 1) * productsPerPage + index + 1;
             const variants = Array.isArray(p.variants) ? p.variants : [];
-            const totalStock = variants.reduce((sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
+            const totalStock = variants.reduce((sum, v) => sum + (v.stockCount || 0), 0);
             const stockEmoji = totalStock > 0 ? '✅' : '❌';
             message += `${stockEmoji} *[${productNumber}]* ${escapeMd(String(p.name || '-').toUpperCase())} → x${totalStock}\n`;
             keyboardButtons.push(Markup.button.callback(`${productNumber}`, `show_product_${p.id}_page_${page}`));
@@ -1358,7 +1382,7 @@ async function generateProductListMessageAndKeyboard(page = 1) {
 // sehingga customer bisa langsung menekan nomor produk untuk melihat detail
 // dan membeli tanpa harus membuka menu 'List Produk' lagi.
 async function generateStockMessageAndKeyboard() {
-    const products = await Product.find({}).sort({ name: 1 }).lean();
+    const products = await Product.aggregate([{ $sort: { name: 1 } }, { $project: PRODUCT_MENU_FIELDS }]);
     let message = `🛒 *Informasi Stok*\n- Tanggal: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}\n────────────✧\n`;
     const productButtons = [];
 
@@ -1367,7 +1391,7 @@ async function generateStockMessageAndKeyboard() {
     } else {
         products.forEach((p, index) => {
             const variants = Array.isArray(p.variants) ? p.variants : [];
-            const totalStock = variants.reduce((sum, v) => sum + (Array.isArray(v.stock) ? v.stock.length : 0), 0);
+            const totalStock = variants.reduce((sum, v) => sum + (v.stockCount || 0), 0);
             const stockEmoji = totalStock > 0 ? '✅' : '❌';
             const productNumber = index + 1;
             // FIX BUG: nama produk di-escape agar karakter _ * ` [ ] tidak
@@ -1406,7 +1430,7 @@ async function generateStockTextMessage() {
 
 async function generateProductDetailsMessageAndKeyboard(productId, page) {
     try {
-        const product = await Product.findOne({ id: productId }).lean();
+        const [product] = await Product.aggregate([{ $match: { id: productId } }, { $project: PRODUCT_MENU_FIELDS }]);
 
         if (!product) {
             return { 
@@ -1426,7 +1450,7 @@ async function generateProductDetailsMessageAndKeyboard(productId, page) {
 
         const variantButtons = [];
         product.variants.forEach(v => {
-            const stockCount = (Array.isArray(v.stock) ? v.stock.length : 0);
+            const stockCount = v.stockCount || 0;
             const stockEmoji = stockCount > 0 ? '✅' : '❌';
             const stockStatus = stockCount > 0 ? `Stok: ${stockCount}` : 'Stok: Habis';
             
@@ -4571,7 +4595,7 @@ const httpServer = app.listen(PORT, () => {
 });
 
 // Jalankan Telegram Bot
-databaseReady.then(() => botRunner.start()).catch(err => {
+botRunner.start().catch(err => {
     console.error('❌ Error saat menjalankan bot:', err);
 });
 
@@ -4622,6 +4646,7 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
     console.error('[UNCAUGHT EXCEPTION]', err);
+    updateGuard.stop();
     // A fatal exception can leave state inconsistent; let Render restart the process.
     botRunner.stop('uncaughtException');
     setTimeout(() => process.exit(1), 1000).unref();
@@ -4635,6 +4660,8 @@ let shuttingDown = false;
 function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
+    console.warn(`[SHUTDOWN] signal=${signal} uptime=${Math.floor(process.uptime())}s rss=${Math.round(process.memoryUsage().rss / 1048576)}MB`);
+    updateGuard.stop();
     botRunner.stop(signal);
     httpServer.close();
     // Leave time for in-flight handlers before Render's forced termination.

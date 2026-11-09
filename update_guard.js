@@ -21,6 +21,7 @@ module.exports = function createUpdateGuard({ isOwner, onError }) {
             .catch(error => onError(error, job.ctx))
             .catch(error => console.error('[BOT] Error handler gagal:', error.message))
             .finally(() => {
+                job.finish(true);
                 lane.active--;
                 busy.delete(job.key);
                 release(job.key);
@@ -47,9 +48,12 @@ module.exports = function createUpdateGuard({ isOwner, onError }) {
                 return;
             }
             users.set(key, (users.get(key) || 0) + 1);
-            const job = { ctx, next, key };
+            let finish;
+            const done = new Promise(resolve => { finish = resolve; });
+            const job = { ctx, next, key, finish };
             if (canRun) run(job, lane);
             else lane.queue.push(job);
+            return done;
         },
         stats() {
             return { active: regular.active + owner.active, queued: regular.queue.length + owner.queue.length, dropped };
@@ -57,7 +61,7 @@ module.exports = function createUpdateGuard({ isOwner, onError }) {
         stop() {
             stopped = true;
             for (const lane of [regular, owner]) {
-                for (const job of lane.queue.splice(0)) release(job.key);
+                for (const job of lane.queue.splice(0)) { release(job.key); job.finish(false); }
             }
         },
     };

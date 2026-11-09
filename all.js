@@ -103,7 +103,12 @@ const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const protectTelegram = require('./telegram_timeout');
 protectTelegram(bot.telegram);
-const botRunner = require('./bot_runner')(bot);
+const botRunner = process.env.RENDER_EXTERNAL_URL
+    ? require('./webhook_runner')({ bot, app, origin: process.env.RENDER_EXTERNAL_URL,
+        primary: process.env.TELEGRAM_PRODUCTION_URL || undefined, token: process.env.BOT_TOKEN,
+        configuredSecret: process.env.TELEGRAM_WEBHOOK_SECRET, db: mongoose.connection,
+        dataReady: () => agpReady && mongoose.connection.readyState === 1 })
+    : require('./bot_runner')(bot);
 const agpDelivery = require('./autogopay_delivery')({
     Order, telegram: bot.telegram,
     formatItemsForFile: async (items, order) => {
@@ -133,7 +138,8 @@ const updateGuard = require('./update_guard')({
 });
 bot.use((ctx, next) => {
     protectTelegram(ctx.telegram);
-    updateGuard.dispatch(ctx, next);
+    const work = updateGuard.dispatch(ctx, botRunner.once ? () => botRunner.once(ctx.update, next) : next);
+    botRunner.track?.(ctx.update, work);
 });
 // Tombol "Matikan notifikasi" di bawah setiap testimoni channel. Didaftarkan PALING AWAL
 // supaya subscriber channel yang menekannya tidak ikut tercatat sebagai user bot.
@@ -144,7 +150,7 @@ bot.command('botstatus', async ctx => {
     if (!ownerIdList().includes(String(ctx.from.id))) return;
     const stats = updateGuard.stats();
     const failure = botRunner.lastFailure();
-    await ctx.reply(`Status bot\nCommit: ${String(process.env.RENDER_GIT_COMMIT || 'lokal').slice(0, 7)}\nPolling: ${botRunner.isHealthy() ? 'aktif' : 'memulihkan koneksi'}\nError polling terakhir: ${failure ? `${failure.code} (${new Date(failure.at).toISOString()})` : '-'}\nDatabase: ${mongoose.connection.readyState === 1 ? 'terhubung' : 'belum terhubung'}\nPembayaran siap: ${agpReady}\nRAM RSS: ${Math.round(process.memoryUsage().rss / 1048576)} MB\nPekerjaan aktif: ${stats.active}\nAntrean: ${stats.queued}\nUpdate dibatasi sejak restart: ${stats.dropped}\nUptime: ${Math.floor(process.uptime())} detik`);
+    await ctx.reply(`Status bot\nCommit: ${String(process.env.RENDER_GIT_COMMIT || 'lokal').slice(0, 7)}\nTelegram (${botRunner.mode || 'polling'}): ${botRunner.isHealthy() ? 'aktif' : 'memulihkan koneksi'}\nError koneksi terakhir: ${failure ? `${failure.code} (${new Date(failure.at).toISOString()})` : '-'}\nDatabase: ${mongoose.connection.readyState === 1 ? 'terhubung' : 'belum terhubung'}\nPembayaran siap: ${agpReady}\nRAM RSS: ${Math.round(process.memoryUsage().rss / 1048576)} MB\nPekerjaan aktif: ${stats.active}\nAntrean: ${stats.queued}\nUpdate dibatasi sejak restart: ${stats.dropped}\nUptime: ${Math.floor(process.uptime())} detik`);
 });
 bot.use(async (ctx, next) => {
     if (agpReady && mongoose.connection.readyState === 1) return next();
@@ -3351,6 +3357,8 @@ app.get(['/health', '/ping'], (req, res) => {
 // Readiness is for monitoring; Render uses /health so retries/rolling deploys can finish.
 app.get('/ready', (req, res) => {
     const ready = agpReady && mongoose.connection.readyState === 1 && botRunner.isHealthy();
+    res.set('X-Bot-Transport', botRunner.mode || 'polling');
+    if (process.env.RENDER_GIT_COMMIT) res.set('X-Bot-Revision', process.env.RENDER_GIT_COMMIT.slice(0, 7));
     res.set('Cache-Control', 'no-store');
     res.status(ready ? 200 : 503).send(ready ? 'READY' : 'NOT READY');
 });

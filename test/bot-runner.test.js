@@ -125,7 +125,7 @@ test('Render health stays live during dependency recovery; readiness reports the
     let handler;
     const context = {
         app: { get: (paths, fn) => { assert.equal(JSON.stringify(paths), '["/health","/ping"]'); handler = fn; } },
-        agpReady: true, mongoose: { connection: { readyState: 1 } },
+        process: { env: { RENDER_GIT_COMMIT: 'abcdef0123456' } }, agpReady: true, mongoose: { connection: { readyState: 1 } },
         botRunner: { isAlive: () => true, isHealthy: () => true },
     };
     const start = appSource.indexOf("app.get(['/health', '/ping']");
@@ -150,7 +150,7 @@ test('Render health stays live during dependency recovery; readiness reports the
     vm.runInNewContext(appSource.slice(readyStart, appSource.indexOf('\n});', readyStart) + 4), context);
     assert.equal(request().status, 503);
     context.mongoose.connection.readyState = 1;
-    assert.deepEqual(request(), { 'Cache-Control': 'no-store', status: 200, text: 'READY' });
+    assert.deepEqual(request(), { 'Cache-Control': 'no-store', 'X-Bot-Transport': 'polling', 'X-Bot-Revision': 'abcdef0', status: 200, text: 'READY' });
     context.botRunner.isHealthy = () => false;
     assert.equal(request().status, 503);
     context.botRunner.isHealthy = () => true; context.agpReady = false;

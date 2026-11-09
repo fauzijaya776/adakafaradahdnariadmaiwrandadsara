@@ -95,6 +95,7 @@ async function getAdminMenuMessageAndKeyboard() {
   'Silakan pilih opsi manajemen:';
 
   const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('⚡ Tambah Stok Cepat', 'qs:open')],
     [Markup.button.callback('➕ Tambah Stok', 'admin_add_stock_select_product_1')],
     [Markup.button.callback('📤 Ambil Stok', 'ats_prod_1')],
     [Markup.button.callback('👁️ Lihat Stok', 'vst_prod_1')],
@@ -985,6 +986,7 @@ async function viewStock(productId, variantSlug, ctx) {
 }
 
 module.exports = (bot) => {
+  require('./quick_stock_menu')(bot, { Product, Settings, mongoose, userStates, adminMiddleware, getAdminMenuMessageAndKeyboard });
   bot.command('admin', adminMiddleware, async (ctx) => {
     const {
       message, keyboard

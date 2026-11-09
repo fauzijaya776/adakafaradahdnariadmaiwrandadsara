@@ -115,6 +115,8 @@ const OrderSchema = new mongoose.Schema({
 const SettingsSchema = new mongoose.Schema({
     // Dibuat unik agar hanya ada satu dokumen pengaturan
     identifier: { type: String, default: 'global-settings', unique: true }, 
+    quickStockRoutes: { type: mongoose.Schema.Types.Mixed, default: {} },
+    quickStockRevision: { type: Number, default: 0 },
     autogopayActiveOrder: String,
     autogopayNextGenerateAt: Date,
     autogopayCircuitOpen: { type: Boolean, default: false },
